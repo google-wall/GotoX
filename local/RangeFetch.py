@@ -5,11 +5,11 @@
 import re
 import threading
 import random
-from . import clogging as logging
+import logging
 from time import time, sleep
 from .compat import Queue, thread, urlparse
 from .common import spawn_later
-from .GAEFetch import qGAE, gae_urlfetch
+from .GAEFetch import qGAE, get_appid, mark_badappid, gae_urlfetch
 from .GlobalConfig import GC
 from .HTTPUtil import http_gws
 from .GAEUpdate import testip, testallgaeip
@@ -34,8 +34,7 @@ class RangeFetch:
         self.iplist = GC.IPLIST_MAP['google_gws'].copy()
 
         self.handler = handler
-        self.get_appid = handler.get_appid
-        self.write = handler.write
+        self.write = handler.wfile.write
         self.bufsize = handler.bufsize
         self.command = handler.command
         self.host = handler.host
@@ -77,20 +76,20 @@ class RangeFetch:
             response_headers['Content-Length'] = str(length - start)
 
         try:
-            self.write(('HTTP/1.1 %s\r\n%s\r\n' % (response_status, ''.join('%s: %s\r\n' % (k, v) for k, v in response_headers.items()))))
+            self.handler.write(('HTTP/1.1 %s\r\n%s\r\n' % (response_status, ''.join('%s: %s\r\n' % (k, v) for k, v in response_headers.items()))))
         except Exception as e:
-            logging.info('%s RangeFetch 本地链接断开：%r, %r', self.address_string(response), self.url, e)
+            logging.info('%s RangeFetch 本地连接断开：%r, %r', self.address_string(response), self.url, e)
             self.record()
             return
         logging.info('%s >>>>>>>>>>>>>>> RangeFetch 开始 %r %d-%d', self.address_string(response), self.url, start, range_end)
 
         #开始多线程时先测试一遍 IP
-        if isRangeFetchBig:
-            sleeptime = self.sleeptime
-            if needtest and time() - RangeFetch.lastactive > 30:
-                testallgaeip(True)
-        else:
-            sleeptime = self.sleeptime if needtest and time() - RangeFetch.lastactive > 30 and testallgaeip(True) else 0
+#        if isRangeFetchBig:
+#            sleeptime = self.sleeptime
+#            if needtest and time() - RangeFetch.lastactive > 30:
+#                testallgaeip(True)
+#        else:
+#            sleeptime = self.sleeptime if needtest and time() - RangeFetch.lastactive > 30 and testallgaeip(True) else 0
 
         data_queue = Queue.PriorityQueue()
         range_queue = Queue.PriorityQueue()
@@ -111,9 +110,9 @@ class RangeFetch:
 
         for i in range(self.threads):
             if isRangeFetchBig:
-                spawn_later(sleeptime * i if i else 0, self.__fetchlet, range_queue, data_queue, i + 1)
+                spawn_later(self.sleeptime * i if i else 0, self.__fetchlet, range_queue, data_queue, i + 1)
             else:
-                spawn_later(sleeptime if i else 0, self.__fetchlet, range_queue, data_queue, i + 1)
+                spawn_later(self.sleeptime if i else 0, self.__fetchlet, range_queue, data_queue, i + 1)
         has_peek = hasattr(data_queue, 'peek')
         peek_timeout = 30
         self.expect_begin = start
@@ -147,7 +146,7 @@ class RangeFetch:
                 self.write(data)
                 self.expect_begin += len(data)
             except Exception as e:
-                logging.info('%s RangeFetch 本地链接断开：%r, %r', self.address_string(), self.url, e)
+                logging.info('%s RangeFetch 本地连接断开：%r, %r', self.address_string(), self.url, e)
                 break
         else:
             logging.info('%s RangeFetch 成功完成 %r', self.address_string(), self.url)
@@ -184,7 +183,7 @@ class RangeFetch:
                         self.response = None
                         start, end = self.firstrange
                     else:
-                        appid = self.get_appid()
+                        appid = get_appid()
                         if self._last_app_status.get(appid, 200) >= 500:
                             sleep(2)
                         start, end = range_queue.get(timeout=1)
@@ -218,7 +217,7 @@ class RangeFetch:
                     range_queue.put((start, end))
                 elif response.app_status == 503:
                     if appid:
-                        self.handler.mark_badappid(appid)
+                        mark_badappid(appid)
                     range_queue.put((start, end))
                     noerror = False
                 elif response.app_status != 200:
@@ -284,6 +283,8 @@ class RangeFetch:
                              if xip in self.iplist and len(self.iplist) > self.minip:
                                 self.iplist.remove(xip)
                                 logging.warning('%s RangeFetch 移除故障 ip %s', self.address_string(response), xip)
+                if noerror:
+                    sleep(0.1)
 
 class RangeFetchFast(RangeFetch):
     maxsize = GC.AUTORANGE_FAST_MAXSIZE or 1024 * 1024 * 4

@@ -10,39 +10,40 @@ import socket
 import random
 import socks
 import threading
+import logging
 from select import select
 from time import time, sleep
 from functools import partial
 from . import CertUtil
-from . import clogging as logging
+from .path import web_dir
 from .compat import BaseHTTPServer, urlparse, thread, hasattr
+from .compat.openssl import SSL, SSLConnection
 from .common import (
-    web_dir,
     NetWorkIOError,
     reset_errno,
     closed_errno,
     pass_errno,
-    get_refreshtime,
     LRUCache,
     message_html,
-    isip
+    isip,
+    isipv6
     )
 from .common.decompress import decompress_readers
-from .common.dns import set_dns, dns_resolve
+from .common.dns import reset_dns, set_dns, dns_resolve
 from .common.proxy import parse_proxy, proxy_no_rdns
 from .common.region import isdirect
 from .GlobalConfig import GC
 from .GAEUpdate import testip
 from .HTTPUtil import http_gws, http_nor
 from .RangeFetch import RangeFetchs
-from .GAEFetch import qGAE, gae_urlfetch
+from .GAEFetch import qGAE, get_appid, mark_badappid, gae_urlfetch
 from .FilterUtil import (
     set_temp_action,
-    filters_cache,
-    ssl_filters_cache,
+    set_temp_connect_action,
     get_action,
     get_connect_action
     )
+from .FilterConfig import ACTION_FILTERS
 
 normattachment = partial(re.compile(r'(?<=filename=)([^"\']+)').sub, r'"\1"')
 getbytes = re.compile(r'^bytes=(\d*)-(\d*)(,..)?').search
@@ -50,10 +51,10 @@ getrange = re.compile(r'^bytes (\d+)-(\d+)/(\d+|\*)').search
 
 class AutoProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
-    nLock = threading.Lock()
-    nappid = 0
     CAPath = '/ca', '/cadownload'
-    gae_fetcmd = 'GET', 'POST', 'HEAD', 'PUT', 'DELETE', 'PATCH'
+    valid_cmds = {'CONNECT', 'GET', 'POST', 'HEAD', 'PUT', 'DELETE', 'OPTIONS', 'TRACE', 'PATCH'}
+    valid_leadbytes = set(cmd[0].encode() for cmd in valid_cmds)
+    gae_fetcmds = {'GET', 'POST', 'HEAD', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'}
     skip_request_headers = (
         'Vary',
         'Via',
@@ -62,12 +63,12 @@ class AutoProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         'Proxy-Connection',
         'Upgrade',
         'X-Chrome-Variations',
-        #'Connection',
         #'Cache-Control'
         )
     skip_response_headers = (
         'Content-Length',
         'Transfer-Encoding',
+        'Connection',
         'Content-MD5',
         'Set-Cookie',
         'Upgrade',
@@ -77,43 +78,150 @@ class AutoProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
     fwd_timeout = GC.LINK_FWDTIMEOUT
     fwd_keeptime = GC.LINK_FWDKEEPTIME
-    listen_port = GC.LISTEN_GAE_PORT, GC.LISTEN_AUTO_PORT
+    listen_port = {GC.LISTEN_GAE_PORT, str(GC.LISTEN_GAE_PORT),
+                   GC.LISTEN_AUTO_PORT, str(GC.LISTEN_AUTO_PORT)}
     request_compress = GC.LINK_REQUESTCOMPRESS
 
     #可修改
-    context_cache = LRUCache(32)
+    timeout = 60 * 6
+    context_cache = LRUCache(256)
     proxy_connection_time = LRUCache(32)
     badhost = LRUCache(16, 120)
-    badappids = LRUCache(len(GC.GAE_APPIDS))
     rangesize = min(GC.GAE_MAXSIZE, GC.AUTORANGE_FAST_MAXSIZE * 4, 1024 * 1024 * 3)
 
     #默认值
+    ssl_servername = GC.LISTEN_IPHOST or '127.0.0.1'
+    ssl_request = False
+    tunnel = False
     ssl = False
     fakecert = False
+    host = None
     url = None
     url_parts = None
     conaborted = False
+    action = ''
+
+    def __init__(self, request, client_address, server):
+        self.client_address = client_address
+        self.server = server
+        #添加 https 代理协议支持
+        leadbyte = request.recv(1, socket.MSG_PEEK)
+        #估计支持的程序都不会使用旧 SSL 协议，故不予支持
+        if leadbyte == b'\x16':
+            context = self.get_context(self.ssl_servername)
+            context.set_tlsext_servername_callback(self.pick_certificate)
+            try:
+                request = SSLConnection(context, request)
+                request.set_accept_state()
+                self.ssl_request = True
+                rd, _, ed = select([request], [], [request], 4)
+                if ed:
+                    raise socket.error(ed)
+                byte = request.recv(1, socket.MSG_PEEK) if rd else None
+                if not byte:
+                    #未收到后续请求数据，判断证书验证失败
+                    raise ssl.SSLError('客户端证书验证失败，请检查双方主机名称设置是否匹配')
+            except Exception as e:
+                #if e.args[0] not in pass_errno:
+                servername = request.get_servername() or self.ssl_servername
+                logging.warning('%s https 代理失败：sni=%r，%r', self.address_string(), servername, e)
+                return
+        elif leadbyte not in self.valid_leadbytes:
+            return
+        self.request = request
+        self.setup()
+        try:
+            self.handle()
+        finally:
+            self.finish()
+
+    def pick_certificate(self, connection):
+        servername = connection.get_servername()
+        if servername is None:
+            if GC.LISTEN_IPHOST is self.ssl_servername:
+                return
+            servername = GC.LISTEN_IPHOST
+        else:
+            servername = str(servername, 'iso-8859-1')
+        if not servername:
+            logging.warning('%s https 代理失败：对方使用 IP 访问，GotoX 未设置 IP-Host 名称', self.address_string())
+            return
+        new_context = self.get_context(servername)
+        connection.set_context(new_context)
 
     def setup(self):
+        #仅监听本机时关闭 nagle's algorithm 算法和接收缓冲
+        if not self.disable_nagle_algorithm:
+            client_ip = self.client_address[0]
+            if client_ip.endswith('127.0.0.1') or client_ip == '::1':
+                self.disable_nagle_algorithm = True
+                if sys.platform != 'darwin':
+                    self.request.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 0)
         BaseHTTPServer.BaseHTTPRequestHandler.setup(self)
-        self.write = lambda d: self.wfile.write(d if isinstance(d, bytes) else d.encode())
+
+    def write(self, d, raiseerror=None):
+        if raiseerror is None and not isinstance(d, bytes):
+            d = d.encode()
+        try:
+            self.wfile.write(d)
+        except Exception as e:
+            self.conaborted = True
+            if raiseerror:
+                logging.debug('%s 客户端连接断开：%r, %r', self.address_string(), self.url, e)
+                raise e
+
+    def handle_one_request(self):
+        try:
+            self.raw_requestline = self.rfile.readline(65537)
+            if len(self.raw_requestline) > 65536:
+                self.requestline = ''
+                self.request_version = ''
+                self.command = ''
+                self.send_error(414)
+                return
+            if not self.raw_requestline or \
+                    self.raw_requestline[:1] not in self.valid_leadbytes or \
+                    self.server.is_offline:
+                self.close_connection = True
+                return
+            if not self.parse_request():
+                # An error code has been sent, just exit
+                return
+            if self.command == 'CONNECT':
+                self.do_CONNECT()
+            elif self.command in self.valid_cmds:
+                self.do_METHOD()
+            else:
+                self.send_error(501, 'Unsupported method (%r)' % self.command)
+                return
+            self.wfile.flush() #actually send the response if not already done.
+        except socket.timeout as e:
+            #a read or a write timed out.  Discard this connection
+            self.log_error("Request timed out: %r", e)
+            self.close_connection = True
+        except SSL.Error as e:
+            if isinstance(e.args[0], list) and any('certificate unknown' in arg for arg in e.args[0][0]):
+                logging.warn('%s host=%s，客户端 https 验证失败！可能未安装 GotoX CA 证书。', self.address_string(), self.host)
+            self.close_connection = True
 
     def do_action(self):
-        #记录 gws 链接活动时间
+        #记录 gws 连接活动时间
         #获取 hostname 别名
         self.close_connection = True
-        if self.action == 'do_GAE' and self.headers.get('Upgrade') == 'websocket':
+        if self.headers.get('Upgrade') == 'websocket' and self.action in ('do_DIRECT', 'do_GAE'):
             self.action = 'do_FORWARD'
             self.target = None
-            logging.warn('%s GAE 不支持 websocket %r，转用 FORWARD。', self.address_string(), self.url)
+            logging.warn('%s %s 不支持 websocket %r，转用 FORWARD。', self.address_string(), self.action[3:], self.url)
         if self.action in ('do_DIRECT', 'do_FORWARD'):
             self.hostname = hostname = set_dns(self.host, self.target)
             if hostname is None:
-                logging.error('%s 无法解析主机：%r，路径：%r，请检查是否输入正确！', self.address_string(), self.host, self.path)
-                #返回错误代码和提示页面了，但加密请求不会显示
-                c = message_html('504 解析失败', '504 解析失败<p>主机名 %r 无法解析，请检查是否输入正确！' % self.host).encode()
-                self.write(b'HTTP/1.1 504 Resolve Failed\r\nContent-Type: text/html\r\nContent-Length: %d\r\n\r\n' % len(c))
-                self.write(c)
+                if self.ssl and not self.fakecert:
+                    self.do_FAKECERT()
+                else:
+                    logging.error('%s 无法解析主机：%r，路径：%r，请检查是否输入正确！', self.address_string(), self.host, self.path)
+                    c = message_html('504 解析失败', '504 解析失败<p>主机名 %r 无法解析，请检查是否输入正确！' % self.host).encode()
+                    self.write(b'HTTP/1.1 504 Resolve Failed\r\nContent-Type: text/html\r\nContent-Length: %d\r\n\r\n' % len(c))
+                    self.write(c)
                 return 
             elif hostname.startswith('google'):
                 testip.lastactive = time()
@@ -121,15 +229,14 @@ class AutoProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             testip.lastactive = time()
         getattr(self, self.action)()
 
-    def _do_CONNECT(self):
-        host = self.headers.get('Host', '')
+    def parse_host(self, host, chost, mhost=True):
         port = None
         #从命令获取主机、端口
-        chost, cport = self.parse_netloc(self.path)
-        #确定主机，优先 Host 头域（忽略 CONNECT 命令）
+        chost, cport = urlparse.splitport(chost)
+        #确定主机，优先 Host 头域
         if host:
             #从头域获取主机、端口
-            host, port = self.parse_netloc(host)
+            host, port = urlparse.splitport(host)
             #排除某些程序把代理当成主机名
             if chost and port in self.listen_port and host in self.localhosts:
                 self.host = host = chost
@@ -138,110 +245,71 @@ class AutoProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 self.host = host
         else:
             self.host = host = chost
-        if ':' in host:
-            host = '[' + host + ']'
-        if 'Host' in self.headers:
-            self.headers.replace_header('Host', host)
-        else:
-            self.headers['Host'] = host
-        self.port = port = int(port or cport or 443)
-        #某些 http 链接（前端代理）也可能会使用 CONNECT 方法
-        #认为非 80 端口都是加密链接
-        self.ssl = port != 80
+        if host[0] == '[':
+            self.host = host[1:-1]
+        #确定端口
+        self.port = port = int(port or cport or self.ssl and 443 or 80)
+        #确定 Host 头域
+        if mhost:
+            if (bool(self.ssl), port) not in ((False, 80), (True, 443)):
+                if isipv6(host) and host[0] != '[':
+                    host = '[%s]:%d' % (host, port)
+                else:
+                    host = '%s:%d' % (host, port)
+            else:
+                host = self.host
+            if 'Host' in self.headers:
+                self.headers.replace_header('Host', host)
+            else:
+                self.headers['Host'] = host
+
+    def _do_CONNECT(self):
+        self.write(b'HTTP/1.1 200 Connection Established\r\n\r\n')
+        self.tunnel = True
+        leadbyte = self.connection.recv(1, socket.MSG_PEEK)
+        self.ssl = leadbyte in (b'\x16', b'\x80') # 0x80: ssl20
+        if not self.ssl:
+            return True
+        self.parse_host(self.headers.get('Host'), self.path)
+        #本地地址
+        if self.host in self.localhosts and (
+                self.port in (80, 443) or
+                self.port in self.listen_port):
+            self.do_FAKECERT()
+            return True
 
     def do_CONNECT(self):
         #处理 CONNECT 请求，根据规则过滤执行目标动作
-        if self.is_not_online():
+        if self._do_CONNECT():
             return
-        self._do_CONNECT()
-        ssl = self.ssl
-        host = self.host
-        self.action, self.target = get_connect_action(ssl, host)
-        #本地地址
-        if host in self.localhosts:
-            self.action = 'do_FAKECERT'
-        self.fakecert = ssl and self.action == 'do_FAKECERT'
+        self.action, self.target = get_connect_action(self.ssl, self.host)
         self.do_action()
 
     def _do_METHOD(self):
         self.reread_req = False
-        host = self.headers.get('Host', '')
-        port = None
-        path = self.path
-        url_parts = urlparse.urlsplit(path)
-        #从命令获取主机、端口
-        chost, cport = self.parse_netloc(url_parts.netloc)
-        #确定主机，优先 Host 头域
-        if host:
-            #从头域获取主机、端口
-            host, port = self.parse_netloc(host)
-            #排除某些程序把代理当成主机名
-            if chost and port in self.listen_port and host in self.localhosts:
-                self.host = host = chost
-                port = cport
-            else:
-                self.host = host
-        else:
-            self.host = host = chost
-        if ':' in host:
-            host = '[' + host + ']'
-        if 'Host' in self.headers:
-            self.headers.replace_header('Host', host)
-        else:
-            self.headers['Host'] = host
+        self.url_parts = url_parts = urlparse.urlsplit(self.path)
+        self.parse_host(self.headers.get('Host'), url_parts.netloc)
         #确定协议
-        scheme = url_parts.scheme
-        if scheme:
-            #认为只有 https 协议才是加密链接
-            self.ssl = scheme == 'https'
-        else:
-            scheme = 'https' if self.ssl else 'http'
-        #确定端口
-        self.port = int(port or cport or self.ssl and 443 or 80)
+        scheme = 'https' if self.ssl else 'http'
         #确定网址、去掉可能存在的端口
-        #似乎是 urllib.parse.*.geturl 的 bug，没有检查 IPv6 主机名
-        self.url_parts = url_parts = urlparse.SplitResult(scheme, host, url_parts.path, url_parts.query, '')
+        self.url_parts = url_parts = urlparse.SplitResult(scheme, self.headers.get('Host'), url_parts.path, url_parts.query, '')
         self.url = url = url_parts.geturl()
         #确定路径
-        if path[0] != '/':
+        if self.path[0] != '/':
             self.path = url[url.find('/', 12):]
+        #本地地址
+        if self.host in self.localhosts and (
+                self.port in (80, 443) or
+                self.port in self.listen_port):
+            self.do_LOCAL()
+            return True
 
     def do_METHOD(self):
         #处理其它请求，根据规则过滤执行目标动作
-        if self.is_not_online():
+        if self._do_METHOD():
             return
-        self._do_METHOD()
-        host = self.host
-        path = self.path
-        #本地地址
-        if host in self.localhosts:
-            #发送证书
-            if path.lower() in self.CAPath:
-                return self.send_CA()
-            return self.do_LOCAL()
-        request_headers = self.headers
-        #限制 bilibili 视频请求，以防断流 5MB
-        #if host.endswith('.acgvideo.com') or path.startswith('/ws.acgvideo.com'):
-        #    request_range = request_headers.get('Range')
-        #    range_start = getbytes(request_range).group(1) if request_range is not None else None
-        #    range_start = int(range_start) if range_start else 0
-        #    if 'Range' in request_headers:
-        #        request_headers.replace_header('Range', 'bytes=%d-%d' % (range_start, range_start + 5242879))
-        #    else:
-        #        request_headers['Range'] = 'bytes=%d-%d' % (range_start, range_start + 5242879)
-        #限制 sohu 视频请求，以防拒绝访问
-        if 'Range' in request_headers and path.startswith('/sohu'):
-            del request_headers['Range']
-        self.action, self.target = get_action(self.url_parts.scheme, host, path[1:], self.url)
+        self.action, self.target = get_action(self.url_parts.scheme, self.host, self.path[1:], self.url)
         self.do_action()
-
-    do_GET = do_METHOD
-    do_PUT = do_METHOD
-    do_POST = do_METHOD
-    do_HEAD = do_METHOD
-    do_DELETE = do_METHOD
-    do_OPTIONS = do_METHOD
-    do_PATCH = do_METHOD
 
     def write_response_content(self, data, response, need_chunked):
         length = self.response_length
@@ -250,47 +318,36 @@ class AutoProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             return 0, None
         #写入响应内容
         ndata = len(data) if data else 0
-        if hasattr(response, 'data'):
-            # goproxy 服务端错误信息处理预读数据
+        if hasattr(response, 'app_msg'):
+            # goproxy 服务端错误信息
             if ndata:
                 self.write(data)
             return ndata, None
         wrote = 0
         err = None
-
-        def write(d):
-            try:
-                self.write(d)
-            except Exception as e:
-                self.conaborted = True
-                logging.debug('%s 客户端链接断开：%r, %r', self.address_string(), self.url, e)
-                raise e
-
-        readinto = response.readinto
         buf = memoryview(bytearray(self.bufsize))
         try:
             if ndata:
                 buf[:ndata] = data
             else:
-                ndata = readinto(buf)
+                ndata = response.readinto(buf)
             while ndata:
                 if need_chunked:
-                    write(hex(ndata)[2:])
-                    write(b'\r\n')
-                    write(buf[:ndata].tobytes())
-                    write(b'\r\n')
+                    self.write(b'%x\r\n' % ndata, True)
+                    self.write(buf[:ndata].tobytes(), True)
+                    self.write(b'\r\n', True)
                     wrote += ndata
                 else:
-                    write(buf[:ndata].tobytes())
+                    self.write(buf[:ndata].tobytes(), True)
                     wrote += ndata
                     if wrote >= length:
                         break
-                ndata = readinto(buf)
+                ndata = response.readinto(buf)
         except Exception as e:
             err = e
         finally:
             if need_chunked:
-                write(b'0\r\n\r\n')
+                self.write(b'0\r\n\r\n', True)
             return wrote, err
 
     def handle_request_headers(self):
@@ -299,18 +356,63 @@ class AutoProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             self.close_connection = self.cc
             return self.request_headers.copy(), self.payload
         #处理请求
-        request_headers = dict((k.title(), v) for k, v in self.headers.items() if k.title() not in self.skip_request_headers)
+        request_headers = dict((k.title(), v) for k, v in self.headers.items() \
+                               if k.title() not in self.skip_request_headers)
         pconnection = self.headers.get('Proxy-Connection')
-        if pconnection and self.request_version < 'HTTP/1.1' and pconnection.lower() != 'keep-alive':
+        if pconnection and \
+                self.request_version < 'HTTP/1.1' and \
+                pconnection.lower() != 'keep-alive':
             self.close_connection = True
         else:
             self.close_connection = False
         payload = b''
-        if 'Content-Length' in request_headers:
+        length = int(request_headers.get('Content-Length', 0))
+        if self.action == 'do_GAE':
             try:
-                payload = self.rfile.read(int(request_headers['Content-Length']))
+                #暂时限制为 32MB，实际可能会更小一点
+                if 0 < length < 33554433:
+                    payload = self.rfile.read(length)
+                elif 'Transfer-Encoding' in request_headers:
+                    value = []
+                    length = 0
+                    while True:
+                        chunk_size_str = self.rfile.readline(65537)
+                        if len(chunk_size_str) > 65536:
+                            raise Exception('分块尺寸过大')
+                        chunk_size = int(chunk_size_str.split(b';')[0], 16)
+                        if chunk_size == 0:
+                            while True:
+                                chunk = self.rfile.readline(65537)
+                                if chunk in (b'\r\n', b'\n', b''): # b'' 也许无法读取到空串
+                                    break
+                                else:
+                                    #只能抛弃，如服务器强制要求携带，则请求可能失败
+                                    logging.debug('%s "%s %s %s"分块拖挂：%r', self.address_string(), self.action[3:], self.command, self.url, chunk)
+                            break
+                        chunk = self.rfile.read(chunk_size)
+                        value.append(chunk)
+                        length += len(chunk)
+                        if length > 33554432:
+                            break
+                        if self.rfile.read(2) != b'\r\n':
+                            raise Exception('分块尺寸不匹配 CRLF')
+                    payload = b''.join(value)
+            except Exception as e:
+                logging.error('%s "%s %s %s" 附加内容读取失败：%r', self.address_string(), self.action[3:], self.command, self.url, e)
+                raise
+            if length > 33554432:
+                logging.error('%s "%s %s %s" 附加内容尺寸过大：%d，无法通过 GAE 代理', self.address_string(), self.action[3:], self.command, self.url, length)
+                raise
+        elif self.action != 'do_DIRECT' or length > 65536 or 'Transfer-Encoding' in request_headers:
+            #不读取，直接传递 rfile 以加快代理转发速度
+            payload = self.rfile
+            self.rfile.readed = 0
+        elif length:
+            #小于 64KB 仍然一次读取完毕
+            try:
+                payload = self.rfile.read(length)
             except NetWorkIOError as e:
-                logging.error('%s "%s %s" 附加请求内容读取失败：%r', self.address_string(), self.command, self.url, e)
+                logging.error('%s "%s %s %s" 附加内容读取失败：%r', self.address_string(), self.action[3:], self.command, self.url, e)
                 raise
         # 强制请求压缩内容，之后会自动判断解压缩
         ae = request_headers.get('Accept-Encoding', '')
@@ -339,15 +441,16 @@ class AutoProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             content_length = response.headers.get('Content-Length', '0')
             self.response_length = content_length = int(content_length) if content_length.isdigit() else 0
             response.length = content_length if content_length else None
-        elif hasattr(response, 'data'):
-            self.response_length = content_length = len(response.data)
+        elif hasattr(response, 'app_msg'):
+            self.response_length = content_length = len(response.app_msg)
         else:
             self.response_length = content_length = response.length or 0
         return content_length
 
     def handle_response_headers(self, response):
         #处理响应
-        response_headers = dict((k.title(), v) for k, v in response.headers.items() if k.title() not in self.skip_response_headers)
+        response_headers = dict((k.title(), v) for k, v in response.headers.items() \
+                                if k.title() not in self.skip_response_headers)
         #明确设置 Accept-Ranges
         if response_headers.get('Accept-Ranges') != 'bytes':
             response_headers['Accept-Ranges'] = 'none'
@@ -361,7 +464,8 @@ class AutoProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     response_headers['Content-Encoding'] = ce
                 else:
                     del response_headers['Content-Encoding']
-            if ce and ce not in self.headers.get('Accept-Encoding', '') and ce in decompress_readers:
+            if ce and ce not in self.headers.get('Accept-Encoding', '') and \
+                    ce in decompress_readers:
                 response = decompress_readers[ce](response)
                 del response_headers['Content-Encoding']
                 response_headers.pop('Content-Length', None)
@@ -369,9 +473,9 @@ class AutoProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 self.response_length = 0
                 logging.debug('正在以 %r 格式解压缩 %s', ce, self.url)
         length = self.response_length
-        if hasattr(response, 'data'):
-            # goproxy 服务端错误信息处理预读数据
-            data = response.data
+        if hasattr(response, 'app_msg'):
+            # goproxy 服务端错误信息
+            data = response.app_msg
             response_headers['Content-Type'] = 'text/html; charset=utf-8'
         else:
             data = response.read(self.bufsize)
@@ -380,10 +484,9 @@ class AutoProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             if self.request_version == 'HTTP/1.1':
                 response_headers['Transfer-Encoding'] = 'chunked'
             else:
-                # HTTP/1.1 以下不支持 chunked，关闭链接
+                # HTTP/1.1 以下不支持 chunked，关闭连接
                 need_chunked = False
                 self.close_connection = True
-                response_headers['Proxy-Connection'] = 'close'
         else:
             response_headers['Content-Length'] = length
         cookies = response.headers.get_all('Set-Cookie')
@@ -391,12 +494,13 @@ class AutoProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             response_headers['Set-Cookie'] = '\r\nSet-Cookie: '.join(cookies)
         if 'Content-Disposition' in response_headers:
             response_headers['Content-Disposition'] = normattachment(response_headers['Content-Disposition'])
-        if not self.close_connection:
-            response_headers['Proxy-Connection'] = 'keep-alive'
+        response_headers['Connection' if self.tunnel else 'Proxy-Connection'] = 'close' if self.close_connection else 'keep-alive'
         headers_data = 'HTTP/1.1 %s %s\r\n%s\r\n' % (response.status, response.reason, ''.join('%s: %s\r\n' % x for x in response_headers.items()))
         self.write(headers_data)
         logging.debug('headers_data=%s', headers_data)
-        if 300 <= response.status < 400 and response.status != 304 and 'Location' in response_headers:
+        if 300 <= response.status < 400 and \
+                response.status != 304 and \
+                'Location' in response_headers:
             logging.info('%r 返回包含重定向 %r', self.url, response_headers['Location'])
         if response.status == 304:
             logging.test('%s "%s %s %s HTTP/1.1" %s %s', self.address_string(response), self.action[3:], self.command, self.url, response.status, length or '-')
@@ -405,26 +509,35 @@ class AutoProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         return response, data, need_chunked
 
     def check_useragent(self):
-        #修复某些软件无法正确处理 206 Partial Content 响应的持久链接
+        #修复某些软件无法正确处理 206 Partial Content 响应的持久连接
         user_agent = self.headers.get('User-Agent', '')
-        if (user_agent.startswith('mpv')         # mpv
-            or user_agent.endswith(('(Chrome)', 'Iceweasel/38.2.1'))): # youtube-dl 有时会传递给其它支持的播放器，导致无法辨识，统一关闭
-                                                 # 其它自定义的就没法，此处无法辨识，感觉关闭所有 206 有点划不来
+        if user_agent.startswith('mpv') or \
+            user_agent.endswith(('(Chrome)', 'Iceweasel/38.2.1')):
+            # youtube-dl 有时会传递给其它支持的播放器，导致无法辨识，统一关闭
+            # 其它自定义的就没法，此处无法辨识，感觉关闭所有 206 有点划不来
             self.close_connection = True
 
     def do_DIRECT(self):
         #直接请求目标地址
         hostname = self.hostname
         http_util = http_gws if hostname.startswith('google') else http_nor
-        host = self.host
         request_headers, payload = self.handle_request_headers()
+        headers_sent = False
         for retry in range(2):
+            if retry > 0 and payload and isinstance(payload, bytes) or hasattr(payload, 'readed') and payload.readed:
+                logging.warning('%s do_DIRECT 由于有上传数据 "%s %s" 终止重试', self.address_string(), self.command, self.url)
+                self.close_connection = True
+                if not headers_sent:
+                    c = message_html('504 响应超时', '获取 %r 超时，请稍后重试。' % self.url, '').encode()
+                    self.write(b'HTTP/1.1 504 Gateway Timeout\r\nContent-Type: text/html\r\nContent-Length: %d\r\n\r\n' % len(c))
+                    self.write(c)
+                return
             noerror = True
             response = None
             self.close_connection = self.cc
             try:
                 connection_cache_key = '%s:%d' % (hostname, self.port)
-                response = http_util.request(self, payload, request_headers, connection_cache_key=connection_cache_key)
+                response = http_util.request(self, payload, request_headers, self.bufsize, connection_cache_key)
                 if not response:
                     #重试、网站图标
                     if retry or self.url_parts.path.endswith('favicon.ico'):
@@ -436,23 +549,24 @@ class AutoProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                         self.write(c)
                         return
                     #非默认规则、直连 IP
-                    elif self.target is not None or isdirect(host):
+                    elif self.target is not None or isdirect(self.host):
                         logging.warning('%s do_DIRECT "%s %s" 没有正确响应，重试。', self.address_string(response), self.command, self.url)
                         continue
                     else:
                         logging.warn('%s do_DIRECT "%s %s" 失败，尝试使用 "GAE" 规则。', self.address_string(), self.command, self.url)
                         return self.go_GAE()
-                #发生错误时关闭链接
+                #发生错误时关闭连接
                 if response.status >= 400:
                     noerror = False
                 #拒绝服务、非直连 IP
-                if response.status == 403 and not isdirect(host):
-                    logging.warn('%s do_DIRECT "%s %s" 链接被拒绝，尝试使用 "GAE" 规则。', self.address_string(response), self.command, self.url)
+                if response.status == 403 and not isdirect(self.host):
+                    logging.warn('%s do_DIRECT "%s %s" 连接被拒绝，尝试使用 "GAE" 规则。', self.address_string(response), self.command, self.url)
                     return self.go_GAE()
-                #修复某些软件无法正确处理持久链接（停用）
+                #修复某些软件无法正确处理持久连接（停用）
                 self.check_useragent()
                 self.get_response_length(response)
                 response, data, need_chunked = self.handle_response_headers(response)
+                headers_sent = True
                 _, err = self.write_response_content(data, response, need_chunked)
                 if err:
                     raise err
@@ -461,13 +575,13 @@ class AutoProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 noerror = False
                 if self.conaborted:
                     raise e
-                #链接重置
+                #连接重置
                 if e.args[0] in reset_errno:
-                    if isdirect(host):
-                        logging.warning('%s do_DIRECT "%s %s" 链接被重置，重试。', self.address_string(response), self.command, self.url)
+                    if isdirect(self.host):
+                        logging.warning('%s do_DIRECT "%s %s" 连接被重置，重试。', self.address_string(response), self.command, self.url)
                         continue
                     else:
-                        logging.warning('%s do_DIRECT "%s %s" 链接被重置，尝试使用 "GAE" 规则。', self.address_string(response), self.command, self.url)
+                        logging.warning('%s do_DIRECT "%s %s" 连接被重置，尝试使用 "GAE" 规则。', self.address_string(response), self.command, self.url)
                         return self.go_GAE()
                 elif e.args[0] not in pass_errno:
                     raise e
@@ -486,24 +600,47 @@ class AutoProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                             if GC.GAE_KEEPALIVE or http_util is not http_gws:
                                 http_util.ssl_connection_cache[connection_cache_key].append((time(), response.sock))
                             else:
-                                #干扰严重时考虑不复用 google 链接
+                                #干扰严重时考虑不复用 google 连接
                                 response.sock.close()
                         else:
                             response.sock.used = None
                             http_util.tcp_connection_cache[connection_cache_key].append((time(), response.sock))
 
+    def fake_OPTIONS(self, request_headers):
+        response = [
+            'HTTP/1.1 200 OK',
+            'Access-Control-Allow-Credentials: true',
+            'Access-Control-Allow-Methods: GET, POST, HEAD, PUT, DELETE, OPTIONS, PATCH',
+            'Access-Control-Expose-Headers: Content-Encoding, Content-Length, Date, Server, Vary, X-Google-GFE-Backend-Request-Cost, X-FB-Debug, X-Loader-Length',
+            'Access-Control-Max-Age: 1728000',
+            'Vary: Origin, X-Origin',
+            'Content-Length: 0'
+            ]
+        headers = request_headers.get('Access-Control-Request-Headers')
+        if headers:
+            response.append('Access-Control-Allow-Headers: ' + headers)
+        else:
+            response.append('Access-Control-Allow-Headers: Authorization, If-Modified-Since')
+        origin = request_headers.get('Origin')
+        if origin:
+            response.append('Access-Control-Allow-Origin: ' + origin)
+        else:
+            response.append('Access-Control-Allow-Origin: *')
+        response.append('\r\n')
+        self.write('\r\n'.join(response))
+        logging.info('%s "%s FAKEOPTIONS %s HTTP/1.1" 200 0', self.address_string(response), self.action[3:], self.url)
+
     def do_GAE(self):
         #发送请求到 GAE 代理
-        if self.command not in self.gae_fetcmd:
+        if self.command not in self.gae_fetcmds:
             logging.warn('%s GAE 不支持 "%s %s"，转用 DIRECT。', self.address_string(), self.command, self.url)
             self.action = 'do_DIRECT'
             self.target = None
             return self.do_action()
         url_parts = self.url_parts
         request_headers, payload = self.handle_request_headers()
-        #为使用非标准端口的网址加上端口
-        if (url_parts.scheme, self.port) not in (('http', 80), ('https', 443)):
-            self.url = '%s://%s:%s%s' % (url_parts.scheme, self.host, self.port, self.path)
+        if self.command == 'OPTIONS':
+            return self.fake_OPTIONS(request_headers)
         #排除不支持 range 的请求
         need_autorange = self.command != 'HEAD' and 'range=' not in url_parts.query and 'range/' not in self.path and 'live=1' not in url_parts.query
         self.range_end = range_end = range_start = 0
@@ -560,7 +697,7 @@ class AutoProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     self.write(b'HTTP/1.1 504 Gateway Timeout\r\nContent-Type: text/html\r\nContent-Length: %d\r\n\r\n' % len(c))
                     self.write(c)
                 return
-            appid = self.get_appid()
+            appid = get_appid()
             noerror = True
             data = None
             response = None
@@ -582,43 +719,44 @@ class AutoProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                         continue
                 #处理 GoProxy 错误信息
                 if response.reason == 'debug error':
-                    data = response.read().decode()
+                    app_msg = response.app_msg.decode()
                     #密码错误
                     if response.app_status == 403:
                         logging.warning('GAE：%r 密码错误！你设置的密码是： %r', appid, GC.GAE_PASSWORD)
-                        data = '<h1>******   GAE：%r 密码错误！请修改后重试。******</h1>' % appid
+                        app_msg = '<h1>******   GAE：%r 密码错误！请修改后重试。******</h1>' % appid
                     # GoProxy 临时错误，重试
                     elif response.app_status == 502:
-                        if 'DEADLINE_EXCEEDED' in data:
+                        if 'DEADLINE_EXCEEDED' in app_msg:
                             logging.warning('GAE：%r urlfetch %r 返回 DEADLINE_EXCEEDED，重试', appid, self.url)
                             continue
-                        elif 'ver quota' in data:
+                        elif 'ver quota' in app_msg:
                             logging.warning('GAE：%r urlfetch %r 返回 over quota，重试', appid, self.url)
-                            self.badappids.set(appid, True, 60)
-                            for _ in range(GC.GAE_MAXREQUESTS):
-                                qGAE.get()
+                            mark_badappid(appid, 60)
                             continue
-                        elif 'urlfetch: CLOSED' in data:
+                        elif 'urlfetch: CLOSED' in app_msg:
                             logging.warning('GAE：%r urlfetch %r 返回 urlfetch: CLOSED，重试', appid, self.url)
                             sleep(0.5)
                             continue
+                        elif 'RESPONSE_TOO_LARGE' in app_msg:
+                            logging.warning('GAE：%r urlfetch %r 返回 urlfetch: RESPONSE_TOO_LARGE，服务器不支持 Range。', appid, self.url)
                     # GoProxy 服务端版本可能不兼容
                     elif response.app_status == 400:
                         logging.error('%r 部署的可能是 GotoX 不兼容的 GoProxy 服务端版本，如果这条错误反复出现请将之反馈给开发者。', appid)
-                        data = ('<h2>GotoX：%r 部署的可能是 GotoX 不兼容的 GoProxy 服务端版本，如果这条错误反复出现请将之反馈给开发者。<h2>\n'
-                                '错误信息：\n%r' % (appid, data))
-                    response.data = data.encode()
+                        app_msg = ('<h2>GotoX：%r 部署的可能是 GotoX 不兼容的 GoProxy 服务端版本，如果这条错误反复出现请将之反馈给开发者。<h2>\n'
+                                '错误信息：\n%r' % (appid, app_msg))
+                    response.app_msg = app_msg.encode()
                 #网关错误（Bad Gateway｜Gateway Timeout）
                 elif response.app_status in (502, 504):
-                    logging.warning('do_GAE 网关错误，url=%r，重试', self.url)
                     sleep(0.5)
+                    logging.warning('%s do_GAE 网关错误，appid=%r，url=%r，重试', self.address_string(response), appid, self.url)
+                    noerror = False
                     continue
                 #无法提供 GAE 服务（Moved Permanently｜Found｜Forbidden｜Method Not Allowed）
                 elif response.app_status in (301, 302, 403, 405):
                     continue
                 #当前 appid 流量完结(Service Unavailable)
                 elif response.app_status == 503:
-                    self.mark_badappid(appid)
+                    mark_badappid(appid)
                     self.do_GAE()
                     return
                 #服务端出错（Internal Server Error）
@@ -630,7 +768,9 @@ class AutoProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     logging.error('%r 部署的可能是 GotoX 不兼容的服务端，如果这条错误反复出现请将之反馈给开发者。', appid)
                 # appid 不存在（Not Found）
                 elif response.app_status == 404:
-                    if len(GC.GAE_APPIDS) > 1:
+                    if check_appid_exists(appid):
+                        continue
+                    elif len(GC.GAE_APPIDS) > 1:
                         GC.GAE_APPIDS.remove(appid)
                         for _ in range(GC.GAE_MAXREQUESTS):
                             qGAE.get()
@@ -653,7 +793,6 @@ class AutoProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     if not headers_sent:
                         response, data, need_chunked = self.handle_response_headers(response)
                         self.write_response_content(data, response, need_chunked)
-                    self.close_connection = True
                     return
                 #发生异常时的判断条件，放在 read 操作之前
                 content_range = response.headers.get('Content-Range')
@@ -678,7 +817,7 @@ class AutoProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                                     need_autorange = 2
                 elif (  #重试中途失败的请求时返回错误
                         (headers_sent and start > 0) 
-                        #服务器不支持 Range 且错误返回成功状态，直接放弃并断开链接
+                        #服务器不支持 Range 且错误返回成功状态，直接放弃并断开连接
                         or (range_start > 0 and response.status < 300)):
                     self.close_connection = True
                     return
@@ -687,7 +826,7 @@ class AutoProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     logging.info('发现[autorange/big]匹配：%r', self.url)
                     response.status = 206
                     need_autorange = 2
-                #修复某些软件无法正确处理持久链接（停用）
+                #修复某些软件无法正确处理持久连接（停用）
                 self.check_useragent()
                 #第一个响应，不用重复写入头部
                 if not headers_sent:
@@ -705,9 +844,13 @@ class AutoProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 return
             except Exception as e:
                 noerror = False
+                if self.conaborted:
+                    raise e
                 errors.append(e)
-                if e.args[0] in closed_errno or isinstance(e, NetWorkIOError) and len(e.args) > 1 and 'bad write' in e.args[1]:
-                    #链接主动终止
+                if e.args[0] in closed_errno or \
+                        (isinstance(e, NetWorkIOError) and len(e.args) > 1 and 'bad write' in e.args[1]) or \
+                        (isinstance(e.args[0], list) and any('bad write' in arg for arg in e.args[0][0])):
+                    #连接主动终止
                     logging.debug('%s do_GAE %r 返回 %r，终止', self.address_string(response), self.url, e)
                     self.close_connection = True
                     return
@@ -737,6 +880,10 @@ class AutoProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                         else:
                             #干扰严重时考虑不复用
                             response.sock.close()
+                if retry == GC.GAE_FETCHMAX - 1 and not headers_sent:
+                    c = message_html('504 GAE 响应超时', 'GAE-%r 请求超时，请稍后重试。' % self.url, str(errors)).encode()
+                    self.write(b'HTTP/1.1 504 Gateway Timeout\r\nContent-Type: text/html\r\nContent-Length: %d\r\n\r\n' % len(c))
+                    self.write(c)
 
     #未配置 AppID
     if not GC.GAE_APPIDS:
@@ -763,79 +910,78 @@ class AutoProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     break
                 except NetWorkIOError as e:
                     logging.warning('%s 转发到 %r 失败：%r', self.address_string(e), self.url or host, e)
-            if hasattr(remote, 'fileno'):
-                # reset timeout default to avoid long http upload failure, but it will delay timeout retry :(
-                remote.settimeout(None)
         else:
             hostip = random.choice(dns_resolve(host))
-            remote = http_util.create_connection((hostip, int(port)), self.ssl, self.fwd_timeout)
+            remote = http_util.create_connection((hostip, port), self.ssl, self.fwd_timeout)
         if remote is None:
             if not isdirect(host):
                 if self.command == 'CONNECT':
-                    logging.warning('%s%s do_FORWARD 链接远程主机 (%r, %r) 失败，尝试使用 "FAKECERT & GAE" 规则。', self.address_string(), hostip or '', host, port)
+                    logging.warning('%s%s do_FORWARD 连接远程主机 (%r, %r) 失败，尝试使用 "FAKECERT & GAE" 规则。', self.address_string(), hostip or '', host, port)
                     self.go_FAKECERT_GAE()
                 elif self.headers.get('Upgrade') == 'websocket':
-                    logging.warning('%s%s do_FORWARD websocket 链接远程主机 (%r, %r) 失败。', self.address_string(), hostip or '', host, port)
+                    logging.warning('%s%s do_FORWARD websocket 连接远程主机 (%r, %r) 失败。', self.address_string(), hostip or '', host, port)
                 else:
-                    logging.warning('%s%s do_FORWARD 链接远程主机 (%r, %r) 失败，尝试使用 "GAE" 规则。', self.address_string(), hostip or '', host, port)
+                    logging.warning('%s%s do_FORWARD 连接远程主机 (%r, %r) 失败，尝试使用 "GAE" 规则。', self.address_string(), hostip or '', host, port)
                     self.go_GAE()
             return
         if self.fakecert:
-            remote = http_util.get_ssl_socket(remote, self.host.encode())
+            remote = http_util.get_ssl_socket(remote, http_util.get_server_hostname(connection_cache_key, host))
             remote.connect(remote.xip)
             remote.do_handshake()
-            logging.info('%s "FWD %s %s HTTP/1.1" - -', self.address_string(remote), self.command, self.url)
-        else:
+        if self.command == 'CONNECT':
             logging.info('%s "FWD %s %s:%d HTTP/1.1" - -', self.address_string(remote), self.command, host, port)
-        self.forward_socket(remote)
+        else:
+            logging.info('%s "FWD %s %s HTTP/1.1" - -', self.address_string(remote), self.command, self.url)
+        self.forward_connect(remote)
 
     def do_PROXY(self):
         #转发到其它代理
         proxytype, proxyuser, proxypass, proxyaddress = parse_proxy(self.target)
         proxyhost, _, proxyport = proxyaddress.rpartition(':')
-        ips = dns_resolve(proxyhost)
+        ips = dns_resolve(proxyhost).copy()
         if ips:
             ipcnt = len(ips) 
         else:
             logging.error('%s 代理地址无法解析：%s', self.address_string(), self.target)
             return
         if ipcnt > 1:
-            #优先使用未使用 IP，之后按链接速度排序
+            #优先使用未使用 IP，之后按连接速度排序
             ips.sort(key=lambda ip: self.proxy_connection_time.get(ip, 0))
         proxyport = int(proxyport)
         while ips:
-            proxyhost = ips.pop(0)
+            proxyip = ips.pop(0)
             host = dns_resolve(self.host)[0] if self.target in proxy_no_rdns else self.host
             if proxytype:
                 proxytype = proxytype.upper()
             if proxytype not in socks.PROXY_TYPES:
                 proxytype = 'HTTP'
-            proxy = socks.socksocket()
-            proxy.set_proxy(socks.PROXY_TYPES[proxytype], proxyhost, proxyport, True, proxyuser, proxypass)
+            proxy_sock = http_nor.get_proxy_socket(proxyip, 8)
+            proxy_sock.set_proxy(socks.PROXY_TYPES[proxytype], proxyip, proxyport, True, proxyuser, proxypass)
             if ipcnt > 1:
                 start_time = time()
             try:
                 if self.fakecert:
-                    proxy = http_nor.get_ssl_socket(proxy, None if isip(self.host) else self.host.encode())
-                proxy.connect((host, self.port))
+                    proxy_sock = http_nor.get_ssl_socket(proxy_sock, None if isip(self.host) else self.host.encode())
+                proxy_sock.connect((host, self.port))
                 if self.fakecert:
-                    proxy.do_handshake()
+                    proxy_sock.do_handshake()
             except Exception as e:
                 if '0x5b' in e.msg and not isip(host):
                     proxy_no_rdns.add(self.target)
-                    ips.insert(0, proxyhost)
+                    ips.insert(0, proxyip)
                 else:
                     if ipcnt > 1:
-                        self.proxy_connection_time[proxyhost] = self.fwd_timeout + 1 + random.random()
+                        self.proxy_connection_time[proxyip] = self.fwd_timeout + 1 + random.random()
                     logging.error('%s%s:%d 转发 "%s %s" 到 [%s] 代理失败：%s',
-                                  self.address_string(), proxyhost, proxyport, self.command, self.url or self.path, proxytype, self.target)
+                                  self.address_string(), proxyip, proxyport, self.command, self.url or self.path, proxytype, self.target)
                 continue
             else:
                 if ipcnt > 1:
-                    self.proxy_connection_time[proxyhost] = time() - start_time
+                    self.proxy_connection_time[proxyip] = time() - start_time
             logging.info('%s%s:%d 转发 "%s %s" 到 [%s] 代理：%s',
-                         self.address_string(), proxyhost, proxyport, self.command, self.url or self.path, proxytype, self.target)
-            self.forward_socket(proxy)
+                         self.address_string(), proxyip, proxyport, self.command, self.url or self.path, proxytype, self.target)
+            proxy_sock.xip = proxyip, proxyport
+            self.forward_connect(proxy_sock)
 
     def do_REDIRECT(self):
         #重定向到目标地址
@@ -856,35 +1002,22 @@ class AutoProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             #重设网址
             origurl = self.url
             self.url = url = target
-            #重设主机
-            self.url_parts = url_parts = urlparse.urlsplit(target)
-            host, port = self.parse_netloc(url_parts.netloc)
-            self.host = host
-            if ':' in host:
-                host = '[' + host + ']'
-            if mhost:
-                if 'Host' in self.headers:
-                    self.headers.replace_header('Host', host)
-                else:
-                    self.headers['Host'] = host
             #重设协议
             origssl = self.ssl
+            self.url_parts = url_parts = urlparse.urlsplit(target)
             self.ssl = url_parts.scheme == 'https'
-            #重设端口
-            if port:
-                self.port = port
-            elif origssl != self.ssl:
-                if self.ssl and self.port == 80:
-                    self.port = 443
-                elif origssl and self.port == 443:
-                    self.port = 80
-                else:
-                    #不改变非标准端口
-                    self.ssl = origssl
-                    scheme = 'https' if origssl else 'http'
-                    self.url_parts = url_parts = urlparse.SplitResult(scheme, host, url_parts.path, url_parts.query, '')
-                    self.url = url = url_parts.geturl()
-                    logging.warning('%s 由于 %r 使用了非标准端口且重定向目标未明确定义端口，重新内部重定向到 %r', self.address_string(), origurl, url)
+            #重设主机和端口
+            origport = self.port
+            self.parse_host(None, url_parts.netloc, mhost)
+            #未明确定义重定向端口时不改变原非标准端口
+            if origport not in (80, 443) and self.port in (80, 443):
+                self.ssl = origssl
+                self.port = origport
+                scheme = 'https' if origssl else 'http'
+                netloc = '%s:%d' % (self.host, origport)
+                self.url_parts = url_parts = urlparse.SplitResult(scheme, netloc, url_parts.path, url_parts.query, '')
+                self.url = url = url_parts.geturl()
+                logging.warning('%s 由于 %r 使用了非标准端口且重定向目标未明确定义端口，重新内部重定向到 %r', self.address_string(), origurl, url)
             #重设路径
             self.path = target[target.find('/', target.find('//')+3):]
             #重设 action
@@ -895,20 +1028,32 @@ class AutoProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     self.action, self.target = raction
             else:
                 self.action, self.target = get_action(url_parts.scheme, self.host, self.path[1:], url)
-            #内部重定向到加密链接，相当于已伪造证书
-            self.fakecert = self.ssl
             self.do_action()
 
     def do_FAKECERT(self):
-        #为当前客户链接配置一个伪造证书
-        self.write(b'HTTP/1.1 200 Connection Established\r\n\r\n')
-        if not self.fakecert: return
+        #为当前客户连接配置一个伪造证书
+        if not self.ssl:
+            self.close_connection = False
+            return
+        if self.ssl_request:
+            #已经使用 MSG_PEEK 预读过一次<<加密连接>>丢失可读状态
+            #再次握手无法读取到数据，故使用套接字对进行串接
+            p1, p2 = socket.socketpair()
+            payload = self.connection.recv(65536)
+            thread.start_new_thread(self.forward_socket, (self.connection, p1, payload))
+            self.connection = p2
+            self.disable_nagle_algorithm = False
+            logging.warning('%s 正在使用 https 代理协议代理 https 连接，host=%r，建议将 https 连接的代理协议单独设置为 http', self.address_string(), self.host)
         context = self.get_context()
         try:
-            ssl_sock = context.wrap_socket(self.connection, server_side=True)
+            ssl_sock = SSLConnection(context, self.connection)
+            ssl_sock.set_accept_state()
+            self.fakecert = True
+        except ssl.SSLEOFError:
+            return
         except Exception as e:
             if e.args[0] not in pass_errno:
-                logging.exception('%s 伪造加密链接失败：host=%r，%r', self.address_string(), self.host, e)
+                logging.exception('%s 伪造加密连接失败：host=%r，%r', self.address_string(), self.host, e)
             return
         #停止非加密读写
         self.finish()
@@ -920,7 +1065,6 @@ class AutoProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             self.handle()
         finally:
             #关闭加密套接字，并没有真正关闭，还有 2 个 makefile
-            #ssl_sock.shutdown(socket.SHUT_WR)
             ssl_sock.close()
 
     def list_dir(self, path, displaypath):
@@ -983,6 +1127,12 @@ class AutoProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         })
 
     def do_LOCAL(self, filename=None):
+        #发送证书
+        if self.path.lower() in self.CAPath:
+            return self.send_CA()
+        #执行 GotoX 命令
+        elif self.url_parts.path == '/docmd':
+            return self.do_CMD()
         #返回一个本地文件或目录
         self.close_connection = False
         path = urlparse.unquote(self.path)
@@ -1000,6 +1150,7 @@ class AutoProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 logging.info('%s "%s %s HTTP/1.1" 403 -，无法打开本地文件：%r',
                     self.address_string(), self.command, self.url, r)
             return
+        #返回本地文件
         if os.path.isfile(filename):
             content_type = self.guess_type(filename)
             try:
@@ -1013,7 +1164,7 @@ class AutoProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                                'Content-Type: %s\r\n\r\n'
                                % (filesize, content_type))
                     while data:
-                        self.write(data)
+                        self.write(data, True)
                         data = fp.read(1048576)
             except Exception as e:
                 logging.warning('%s "%s %s HTTP/1.1" 403 -，无法打开本地文件：%r',
@@ -1044,7 +1195,8 @@ class AutoProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         self.write(b'HTTP/1.1 200 Ok\r\n'
                    b'Cache-Control: max-age=86400\r\n'
                    b'Expires:Oct, 01 Aug 2100 00:00:00 GMT\r\n')
-        if self.url_parts and self.url_parts.path.endswith(('.jpg', '.gif', '.jpeg', '.png', '.bmp')):
+        if self.url_parts and \
+                self.url_parts.path.endswith(('.jpg', '.gif', '.jpeg', '.png', '.bmp')):
             content = (b'GIF89a\x01\x00\x01\x00\x80\xff\x00\xc0\xc0\xc0'
                        b'\x00\x00\x00!\xf9\x04\x01\x00\x00\x00\x00,\x00'
                        b'\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;')
@@ -1053,49 +1205,52 @@ class AutoProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             self.write(content)
         else:
             self.write(b'Content-Length: 0\r\n\r\n')
-        logging.warning('"%s%s %s" 已经被拦截', self.address_string(), self.command, self.url or self.host)
+        logging.warning('%s "%s %s" 已经被拦截', self.address_string(), self.command, self.url or self.host)
 
     def _set_temp_GAE(self):
         hostparts = 'https' if self.ssl else 'http', self.host
         host = '%s://%s' % hostparts
         #最近是否失败（缓存设置超时两分钟）
         try:
-            if self.badhost[host] & 2 == 0:
-                #记录临时规则的过期时间
+            f = self.badhost[host] & 12
+            if f == 0:
+                self.badhost[host] |= 4
+            elif f == 4:
                 set_temp_action(*hostparts, self.path[1:])
                 logging.warning('将 %r 加入 "GAE" 规则%s。', host, GC.LINK_TEMPTIME_S)
-                self.badhost[host] |= 2
+                self.badhost[host] |= 8
         except KeyError:
-            self.badhost[host] = 0
+            self.badhost[host] = 4
 
     def _set_temp_FAKECERT(self):
         host = 'http%s://%s' % ('s' if self.ssl else '', self.host)
         #最近是否失败（缓存设置超时两分钟）
         try:
-            if self.badhost[host] & 1 == 0:
-                action, _ = filter = ssl_filters_cache[host]
-                #防止重复替换
-                if action != 'do_FAKECERT':
-                    #设置临时规则的过期时间
-                    ssl_filters_cache.set(host, ('do_FAKECERT', filter), GC.LINK_TEMPTIME)
-                logging.warning('将 %r 加入 "FAKECERT" 规则%s。', host, GC.LINK_TEMPTIME_S)
+            f = self.badhost[host] & 3
+            if f == 0:
                 self.badhost[host] |= 1
+            elif f == 1:
+                set_temp_connect_action(host)
+                logging.warning('将 %r 加入 "FAKECERT" 规则%s。', host, GC.LINK_TEMPTIME_S)
+                self.badhost[host] |= 2
         except KeyError:
-            self.badhost[host] = 0
+            self.badhost[host] = 1
 
     def go_GAE(self):
-        if self.command not in self.gae_fetcmd:
+        if self.command not in self.gae_fetcmds:
             return self.go_BAD()
         self._set_temp_GAE()
         self.action = 'do_GAE'
-        self.do_GAE()
+        self.do_action()
 
     def go_FAKECERT(self):
         self._set_temp_FAKECERT()
         self.action = 'do_FAKECERT'
-        self.do_FAKECERT()
+        self.do_action()
 
     def go_FAKECERT_GAE(self):
+        self.path = '/'
+        self._set_temp_GAE()
         self._set_temp_GAE()
         self.go_FAKECERT()
 
@@ -1106,19 +1261,14 @@ class AutoProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         self.write(b'HTTP/1.0 404\r\nContent-Type: text/html\r\nContent-Length: %d\r\n\r\n' % len(c))
         self.write(c)
 
-    def forward_socket(self, remote, tick=4, maxping=None, maxpong=None):
-        #在本地与远程链接间进行数据转发
-        if self.command == 'CONNECT':
-            self.connection.sendall(b'HTTP/1.1 200 Connection Established\r\n\r\n')
-        else:
-            http_headers = ''.join('%s: %s\r\n' % (k.title(), v) for k, v in self.headers.items() if not k.title().startswith('Proxy'))
-            rebuilt_request = '%s\r\n%s\r\n' % (self.requestline, http_headers)
-            remote.sendall(rebuilt_request.encode())
-        local = self.connection
-        buf = memoryview(bytearray(32768)) # 32K
-        maxpong = maxpong or self.fwd_keeptime
+    def forward_socket(self, local, remote, payload=None, timeout=60, tick=4, bufsize=8192, maxping=None, maxpong=None):
+        if payload:
+            remote.sendall(payload)
+        buf = memoryview(bytearray(bufsize))
+        maxpong = maxpong or timeout
         allins = [local, remote]
-        timecount = self.fwd_keeptime
+        timecount = timeout
+        remote_silence_time = 0
         try:
             while allins and timecount > 0:
                 start_time = time()
@@ -1134,40 +1284,77 @@ class AutoProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                         other.sendall(buf[:ndata])
                     else:
                         allins.remove(sock)
-                if t < tick and len(allins) == 2:
+                if remote in allins and remote in ins:
+                    remote_silence_time = 0
+                else:
+                    remote_silence_time += t
+                    if remote_silence_time > maxpong:
+                        break
+                if ins and len(allins) == 2:
                     timecount = min(timecount*2, maxpong)
-        except NetWorkIOError as e:
-            if e.args[0] not in pass_errno:
-                logging.warning('%s 转发 %r 失败：%r', self.address_string(remote), self.url, e)
-                raise
         finally:
             remote.close()
 
-    def get_context(self):
+    def forward_connect(self, remote, timeout=0, tick=4, bufsize=32768, maxping=None, maxpong=None):
+        #在本地与远程连接间进行数据转发
+        payload = None
+        if self.command != 'CONNECT':
+            request_data = []
+            #某些服务器不接受包含完整网址的命令
+            #request_data.append(self.requestline)
+            request_data.append('%s %s %s' % (self.command, self.path, self.protocol_version))
+            for k, v in self.headers.items():
+                if not k.title().startswith('Proxy-'):
+                    request_data.append('%s: %s' % (k.title(), v))
+            request_data.append('\r\n')
+            rebuilt_request = '\r\n'.join(request_data).encode()
+            _, payload = self.handle_request_headers()
+            if isinstance(payload, bytes) and payload:
+                payload = rebuilt_request + payload
+            else:
+                payload = rebuilt_request
+        elif self.ssl_request:
+            #已经使用 MSG_PEEK 预读过一次<<加密连接>>
+            # select 无法获取这次的可读状态，故先读取出来
+            payload = self.connection.recv(65536)
+        try:
+            self.forward_socket(self.connection, remote, payload, timeout or self.fwd_keeptime, tick, bufsize, maxping, maxpong)
+        except NetWorkIOError as e:
+            if e.args[0] not in pass_errno:
+                logging.warning('%s 转发 "%s" 失败：%r', self.address_string(remote), self.url or self.host, e)
+                raise
+        finally:
+            logging.debug('%s 转发终止："%s"', self.address_string(remote), self.url or self.host)
+            #必须在这里设置关闭，前面关闭不起作用，但是中间并没有设置过不关闭？
+            self.close_connection = True
+
+    def get_context(self, servername=None):
         #维护一个 ssl context 缓存
-        host = self.host
+        host = servername or self.host
         ip = isip(host)
         if not ip:
             hostsp = host.split('.')
-            nhost = len(hostsp)
-            if nhost > 3 or (nhost == 3 and len(hostsp[-2]) > 3):
+            #浏览器不会对域名本身的有效性进行验证
+            #如：com.cn 可以作为主机名，也可以使用未注册的顶级域名
+            if len(hostsp) > 2:
                 host = '.'.join(hostsp[1:])
         try:
             return self.context_cache[host]
         except KeyError:
             certfile = CertUtil.get_cert(host, ip)
-            self.context_cache[host] = context = ssl.SSLContext(GC.LINK_LOCALSSL)
-            context.verify_mode = ssl.CERT_NONE
-            context.load_cert_chain(certfile, CertUtil.sub_keyfile)
+            self.context_cache[host] = context = SSL.Context(GC.LINK_LOCALSSL)
+            context.use_privatekey_file(CertUtil.sub_keyfile)
+            context.use_certificate_file(certfile)
+            context.set_session_id('GotoX_SSL_Server')
             return context
 
     def send_CA(self):
         #返回 CA 证书
-        self.close_connection = False
         from .CertUtil import ca_certfile
         with open(ca_certfile, 'rb') as fp:
             data = fp.read()
         logging.info('"%s HTTP/1.1 200"，发送 CA 证书到 %r', self.url, self.address_string())
+        self.close_connection = False
         self.write(b'HTTP/1.1 200 Ok\r\n'
                    b'Content-Type: application/x-x509-ca-cert\r\n')
         if self.path.lower() == self.CAPath[1]:
@@ -1175,52 +1362,25 @@ class AutoProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         self.write('Content-Length: %s\r\n\r\n' % len(data))
         self.write(data)
 
-    def is_not_online(self):
-        #检查代理服务是否运行并释放无效链接
-        if self.server.is_not_online:
-            self.close_connection = True
-            self.connection.close()
-            return True
-
-    def parse_netloc(self, netloc):
-        host, has_br, port = netloc.partition(']')
-        if has_br:
-            # IPv6 必须使用方括号
-            host = host[1:]
-            port = port[1:]
-        else:
-            host, _, port = host.partition(':')
-        return host.lower(), port
-
-    def get_appid(self):
-        with self.nLock:
-            nappid = self.__class__.nappid
-            while True:
-                nappid += 1
-                if nappid >= len(GC.GAE_APPIDS):
-                    nappid = 0
-                appid = GC.GAE_APPIDS[nappid]
-                contains, expired, _ = self.badappids.getstate(appid)
-                if contains and expired:
-                    for _ in range(GC.GAE_MAXREQUESTS):
-                        qGAE.put(True)
-                if not contains or expired:
-                    break
-            self.__class__.nappid = nappid
-            return appid
-
-    def mark_badappid(self, appid):
-        if appid not in self.badappids:
-            if len(GC.GAE_APPIDS) - len(self.badappids) <= 1:
-                logging.error('全部的 AppID 流量都使用完毕')
-            else:
-                logging.info('当前 AppID[%s] 流量使用完毕，切换下一个…', appid)
-            self.badappids.set(appid, True, get_refreshtime())
-            for _ in range(GC.GAE_MAXREQUESTS):
-                qGAE.get()
+    def do_CMD(self):
+        reqs = urlparse.parse_qs(self.url_parts.query)
+        cmd = reqs['cmd'][0]
+        if cmd == 'reset_dns':
+            #重置 DNS
+            reset_dns()
+        elif cmd == 'reset_autorule':
+            #重置自动规则
+            ACTION_FILTERS.RESET = True
+        self.close_connection = False
+        self.write('HTTP/1.1 204 No Content\r\n'
+                   'Content-Length: 0\r\n\r\n')
+        logging.warning('%s "%s %s HTTP/1.1" 204 0，GotoX 命令执行完毕。',
+            self.address_string(), self.command, self.url)
 
     def log_error(self, format, *args):
-        logging.error('%s "%s %s %s" 失败，%s', self.address_string(), self.action[3:], self.command, self.url, format % args)
+        self.close_connection = True
+        if format != "Request timed out: %r":
+            logging.error('%s "%s %s %s" 失败，%s', self.address_string(), self.action[3:], self.command, self.url or self.host, format % args)
 
     def address_string(self, response=None):
         #返回请求和响应的地址
@@ -1231,42 +1391,30 @@ class AutoProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             elif client_ip == '::1':
                 client_ip = 'L6'
             self.address_str = '%s:%s->' % (client_ip, self.client_address[1])
-        if hasattr(response, 'xip'):
-            if response.xip[1] in (80, 443):
+        if hasattr(self, 'port') and self.port in (80, 443):
+            if hasattr(response, 'xip'):
                 return '%s%s' % (self.address_str, response.xip[0])
-            else:
-                return '%s%s:%s' % (self.address_str, *response.xip)
-        else:
-            return self.address_str
+        elif hasattr(response, 'xip'):
+            return '%s%s:%s' % (self.address_str, *response.xip)
+        elif hasattr(self, 'port'):
+            return '%s:%s' % (self.address_str, self.port)
+        return self.address_str
 
 class GAEProxyHandler(AutoProxyHandler):
 
     def do_CONNECT(self):
-        #处理 CONNECT 请求，使用伪造证书进行链接
-        self._do_CONNECT()
+        #处理 CONNECT 请求，使用伪造证书进行连接
+        if self._do_CONNECT():
+            return
         self.action = 'do_FAKECERT'
-        self.fakecert = True
         self.do_action()
 
     def do_METHOD(self):
         #处理其它请求，转发到 GAE 代理
-        self._do_METHOD()
-        #本地地址
-        if self.host in self.localhosts:
-            #发送证书
-            if self.path.lower() in self.CAPath:
-                return self.send_CA()
-            return self.do_LOCAL()
+        if self._do_METHOD():
+            return
         self.action = 'do_GAE'
         self.do_action()
-
-    do_GET = do_METHOD
-    do_PUT = do_METHOD
-    do_POST = do_METHOD
-    do_HEAD = do_METHOD
-    do_DELETE = do_METHOD
-    do_OPTIONS = do_METHOD
-    do_PATCH = do_METHOD
 
     def go_GAE(self):
         self.go_BAD()

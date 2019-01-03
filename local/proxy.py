@@ -38,7 +38,7 @@
 #      s2marine0         <s2marine0@gmail.com>
 #      Toshio Xiang      <snachx@gmail.com>
 # Compatible:
-#      phuslu's GoProxy GAE Server
+#      phuslu's GoProxy GAE Server (removed)
 #          https://github.com/phuslu/goproxy/tree/server.gae
 
 from . import __version__
@@ -46,8 +46,13 @@ from . import __version__
 import sys
 sys.dont_write_bytecode = True
 
-#这条代码负责导入依赖库路径，不要改变位置
-from .common import gevent, app_root
+#这条代码负责添加依赖库路径，不要改变位置
+from .compat import Queue, thread, SocketServer
+
+import logging
+from .GlobalConfig import GC
+
+logging.setLevel(GC.LISTEN_DEBUGINFO)
 
 import os
 import struct
@@ -55,10 +60,9 @@ import threading
 import socket
 import ssl
 import re
+from gevent import __version__ as geventver
 from OpenSSL import __version__ as opensslver
-from . import clogging as logging
-from .compat import Queue, thread, SocketServer
-from .GlobalConfig import GC
+from .path import icon_gotox
 from .ProxyServer import network_test, start_proxyserver
 from .ProxyHandler import AutoProxyHandler
 
@@ -142,7 +146,7 @@ def main():
                 logging.info('IP 列表 %r 解析结果：iplist=%r', name, resolved_iplist)
                 GC.IPLIST_MAP[name] = resolved_iplist
 
-        network_test(True)
+        network_test(first=True)
         if sys.platform == 'cygwin':
             logging.info('cygwin is not officially supported, please continue at your own risk :)')
             #sys.exit(-1)
@@ -156,9 +160,8 @@ def main():
             import ctypes
             ctypes.windll.kernel32.SetConsoleTitleW('GotoX v%s' % __version__)
             hwnd = ctypes.windll.kernel32.GetConsoleWindow()
-            icon_file = os.path.join(app_root, 'gotox.ico')
-            if os.path.exists(icon_file):
-                hicon = ctypes.windll.user32.LoadImageW(0, icon_file, 1, 0, 0, 16)
+            if os.path.exists(icon_gotox):
+                hicon = ctypes.windll.user32.LoadImageW(0, icon_gotox, 1, 0, 0, 16)
                 if hicon == 0:
                     logging.warning('加载图标文件“GotoX.ico”失败。')
                 else:
@@ -215,7 +218,7 @@ def main():
                                   '如有此现象建议暂时退出以下安全软件来保证 GotoX 运行：\n',]
                     for k, v in displaylist.items():
                         displaystr.append('    %s：%s'
-                            % (k, '、'.join(tasklist[x].filename for x in v)))
+                            % (k, '、'.join(tasklist[x.lower()].filename for x in v)))
                     title = 'GotoX 建议'
                     error = '\n'.join(displaystr)
                     logging.warning(error)
@@ -234,12 +237,10 @@ def main():
         #    logging.info('Uvent enabled, patch forward_socket')
         #    AutoProxyHandler.forward_socket = AutoProxyHandler.green_forward_socket
 
-    from .common.region import IPDBVer
-
-    logging.setLevel(GC.LISTEN_DEBUGINFO)
+    from .common.region import IPDBVer, DDDVer
 
     info = ['==================================================================================\n',]
-    info.append(' GotoX  版 本 : %s (python/%s gevent/%s pyOpenSSL/%s)\n' % (__version__, sys.version.split(' ')[0], gevent.__version__, opensslver))
+    info.append(' GotoX  版 本 : %s (python/%s gevent/%s pyOpenSSL/%s)\n' % (__version__, sys.version.split(' ')[0], geventver, opensslver))
     #info.append(' Uvent Version    : %s (pyuv/%s libuv/%s)\n' % (__import__('uvent').__version__, __import__('pyuv').__version__, __import__('pyuv').LIBUV_VERSION) if all(x in sys.modules for x in ('pyuv', 'uvent')) else '')
     info.append('\n GAE    AppID : %s\n' % ('|'.join(GC.GAE_APPIDS) or '请填入 AppID'))
     info.append('\n GAE 远程验证 : %s启用\n' % '已' if GC.GAE_SSLVERIFY else '未')
@@ -248,10 +249,11 @@ def main():
     info.append('\n Local Proxy  : %s:%s\n' % (GC.PROXY_HOST, GC.PROXY_PORT) if GC.PROXY_ENABLE else '')
     info.append('\n  代 理 认 证 : %s认证\n' % (GC.LISTEN_AUTH == 0 and '无需' or (GC.LISTEN_AUTH == 2 and 'IP ') or 'Basic '))
     info.append('\n  调 试 信 息 : %s\n' % logging._levelToName[GC.LISTEN_DEBUGINFO])
-    info.append('\n  链 接 模 式 : 远程 - %s / gevent%s\n' % (GC.LINK_REMOTESSLTXT, ' + OpenSSL' if GC.LINK_OPENSSL else ''))
+    info.append('\n  连 接 模 式 : 远程 - %s / gevent%s\n' % (GC.LINK_REMOTESSLTXT, ' + OpenSSL' if GC.LINK_OPENSSL else ''))
     info.append('                本地 - %s / gevent\n' % GC.LINK_LOCALSSLTXT)
     info.append('\n  网 络 配 置 : %s\n' % GC.LINK_PROFILE)
     info.append('\n  IP 数 据 库 : %s\n' % IPDBVer)
+    info.append('\n  直 连 域 名 : %s\n' % DDDVer)
     info.append('\n  安 装 证 书 : 设置代理后访问 http://gotox.go/\n')
     info.append('==================================================================================\n')
     sys.stdout.write(''.join(info))

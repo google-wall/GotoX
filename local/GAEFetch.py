@@ -1,18 +1,78 @@
 # coding:utf-8
 
+import ssl
 import zlib
 import struct
+import threading
+import logging
 from io import BytesIO
-from . import clogging as logging
+from time import time, timezone, localtime, strftime, strptime, mktime
+from urllib.request import ProxyHandler, HTTPSHandler, build_opener
 from .compat import Queue, httplib
 from .GlobalConfig import GC
 from .GAEUpdate import testipuseable
 from .HTTPUtil import http_gws
+from .common import LRUCache
 from .common.decompress import GzipSock
 
+timezone_PST = timezone - 3600 * 8 # UTC-8
+timezone_PDT = timezone - 3600 * 7 # UTC-7
+def get_refreshtime():
+    #距离 GAE 流量配额每日刷新的时间
+    #刷新时间是否遵循夏令时？
+    now = time() + timezone_PST
+    refreshtime = strftime('%y %j', localtime(now + 86400))
+    refreshtime = mktime(strptime(refreshtime, '%y %j'))
+    return refreshtime - now
+
+nappid = 0
+nLock = threading.Lock()
+badappids = LRUCache(len(GC.GAE_APPIDS))
 qGAE = Queue.LifoQueue()
 for _ in range(GC.GAE_MAXREQUESTS * len(GC.GAE_APPIDS)):
     qGAE.put(True)
+
+proxy_server = 'http://127.0.0.1:%d' % GC.LISTEN_AUTO_PORT
+proxy_handler = ProxyHandler({
+    'http': proxy_server,
+    'https': proxy_server
+})
+context = ssl.SSLContext(ssl.PROTOCOL_TLSv1)
+context.verify_mode = ssl.CERT_NONE
+https_handler = HTTPSHandler(context=context)
+proxy_opener = build_opener(proxy_handler, https_handler)
+
+def check_appid_exists(appid):
+    response = proxy_opener.open('https://%s.appspot.com/' % appid)
+    return response.status in (200, 503)
+
+def get_appid():
+    global nappid
+    with nLock:
+        while True:
+            nappid += 1
+            if nappid >= len(GC.GAE_APPIDS):
+                nappid = 0
+            appid = GC.GAE_APPIDS[nappid]
+            contains, expired, _ = badappids.getstate(appid)
+            if contains and expired:
+                for _ in range(GC.GAE_MAXREQUESTS):
+                    qGAE.put(True)
+            if not contains or expired:
+                break
+        return appid
+
+def mark_badappid(appid, time=None):
+    if appid not in badappids:
+        if time is None:
+            time = get_refreshtime()
+            if len(GC.GAE_APPIDS) - len(badappids) <= 1:
+                logging.error('全部的 AppID 流量都使用完毕')
+            else:
+                logging.warning('当前 AppID[%s] 流量使用完毕，切换下一个…', appid)
+        badappids.set(appid, True, time)
+        for _ in range(GC.GAE_MAXREQUESTS):
+            qGAE.get()
 
 gae_options = []
 if GC.GAE_DEBUG:
@@ -120,19 +180,18 @@ def gae_urlfetch(method, url, headers, payload, appid, getfast=None, **kwargs):
     raw_response_length = len(raw_response_list)
     if raw_response_length == 3:
         _, status, reason = raw_response_list
-        response.status = int(status)
         response.reason = reason.strip()
     elif raw_response_length == 2:
         _, status = raw_response_list
-        status = int(status)
-        #标记 GoProxy 错误信息
-        if status in (400, 403, 502):
-            response.app_status = response.status = status
-            response.reason = 'debug error'
-        else:
-            response.status = status
-            response.reason = ''
+        response.reason = ''
     else:
         return
+    response.status = int(status)
+    #标记服务器端错误信息
+    headers_data, app_msg = headers_data.split(b'\r\n\r\n')
+    if app_msg:
+        response.app_status = response.status
+        response.reason = 'debug error'
+        response.app_msg = app_msg
     response.headers = response.msg = httplib.parse_headers(BytesIO(headers_data))
     return response

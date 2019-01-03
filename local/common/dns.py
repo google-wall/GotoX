@@ -1,31 +1,21 @@
 # coding:utf-8
 
-try:
-    import dnslib
-except ImportError:
-    import sys
-    from . import logging, packages
-    logging.error(u'无法找到 dnslib，请安装 dnslib-0.8.3 以上版本，或将相应 .egg 放到 %r 文件夹！', packages)
-    sys.exit(-1)
-
 import socket
+import dnslib
+import logging
 from select import select
 from time import time, sleep
 from json.decoder import JSONDecoder
-from . import logging, LRUCache, isip, isipv4, isipv6, classlist
+from . import LRUCache, isip, isipv4, isipv6, get_wan_ipv4, classlist, spawn_loop
 from local.compat import Queue, thread
 from local.GlobalConfig import GC
-
-jsondecoder = JSONDecoder()
-dns = LRUCache(GC.DNS_CACHE_ENTRIES, GC.DNS_CACHE_EXPIRATION)
 
 def reset_dns():
     dns.clear()
     #保持链接 GAE 列表不过期
     dns.set('google_gws', GC.IPLIST_MAP['google_gws'], noexpire=True)
     dns.set('google_com', GC.IPLIST_MAP['google_com'], noexpire=True)
-
-reset_dns()
+    dns.set(dnshostalias, GC.IPLIST_MAP[GC.DNS_OVER_HTTPS_LIST], noexpire=True)
 
 def set_dns(host, iporname):
     #先处理正常解析
@@ -40,7 +30,12 @@ def set_dns(host, iporname):
         if dns_resolve(_host):
             return _host
     #生成唯一别名
-    namea = id(iporname) if isinstance(iporname, list) else iporname
+    namea = str(id(iporname)) if isinstance(iporname, list) else iporname
+    if namea.startswith(('google_', 'cdn_')):
+        #host = get_main_domain(host)
+        host = ''
+    if '.google' in host:
+        namea = 'google_' + namea
     hostname = '%s|%s' % (namea, host)
     if hostname in dns:
         return hostname
@@ -84,9 +79,13 @@ def dns_resolve(host):
             dns.set(host, 0, 300)
     return iplist
 
+
 dnshostalias = 'dns.over.https'
 https_resolve_cache_key = GC.DNS_OVER_HTTPS_LIST + ':443'
 https_resolve_threads = max(min((GC.LINK_WINDOW - 1), 3), 1)
+jsondecoder = JSONDecoder()
+dns = LRUCache(GC.DNS_CACHE_ENTRIES, GC.DNS_CACHE_EXPIRATION)
+reset_dns()
 
 from local.HTTPUtil import http_gws
 
@@ -101,8 +100,9 @@ class dns_params:
     command = 'GET'
     headers = {'Host': host, 'User-Agent': 'GotoX Agent'}
     DNSServerPath = '/resolve?name=%s&type=%s'
-    if GC.DNS_OVER_HTTPS_ECS:
-        DNSServerPath += '&ecs=' + GC.DNS_OVER_HTTPS_ECS.replace('/', '%%2F')
+    _DNSServerPath =  DNSServerPath + '&ecs='
+    if GC.DNS_OVER_HTTPS_ECS and GC.DNS_OVER_HTTPS_ECS != 'auto':
+        DNSServerPath = _DNSServerPath + GC.DNS_OVER_HTTPS_ECS.replace('/', '%%2F')
     Url = 'https://' +  host
 
     __slots__ = 'path', 'url'
@@ -110,6 +110,15 @@ class dns_params:
     def __init__(self, *qargs):
         self.path = self.DNSServerPath % qargs
         self.url = self.Url + self.path
+
+def update_dns_params():
+    if GC.DNS_OVER_HTTPS_ECS == 'auto':
+        ip = get_wan_ipv4()
+        if ip:
+            dns_params.DNSServerPath = dns_params._DNSServerPath + ip
+
+if GC.DNS_OVER_HTTPS_ECS == 'auto':
+    spawn_loop(3600, update_dns_params)
 
 def _https_resolve(qname, qtype, queobj):
     '''
@@ -127,7 +136,7 @@ def _https_resolve(qname, qtype, queobj):
         if response and response.status == 200:
             reply = jsondecoder.decode(response.read().decode())
             # NOERROR = 0
-            if reply and reply['Status'] == 0:
+            if reply and reply['Status'] == 0 and 'Answer' in reply:
                 for answer in reply['Answer']:
                     if answer['type'] == qtype:
                         iplist.append(answer['data'])
@@ -146,9 +155,6 @@ def _https_resolve(qname, qtype, queobj):
     queobj.put(iplist)
 
 def https_resolve(qname, qtype, queobj):
-    if dnshostalias not in dns:
-        dns.set(dnshostalias, GC.IPLIST_MAP[GC.DNS_OVER_HTTPS_LIST], 24 * 3600)
-
     queobjt = Queue.Queue()
     for _ in range(https_resolve_threads):
         thread.start_new_thread(_https_resolve, (qname, qtype, queobjt))
@@ -186,7 +192,7 @@ if '4' in GC.LINK_PROFILE:
 if '6' in GC.LINK_PROFILE:
     qtypes.append(AAAA)
 
-def _dns_remote_resolve(qname, dnsservers, blacklist, timeout, qtypes=qtypes):
+def _dns_remote_resolve(qname, dnsservers, blacklist=[], timeout=2, qtypes=qtypes):
     '''
     http://gfwrev.blogspot.com/2009/11/gfwdns.html
     http://zh.wikipedia.org/wiki/域名服务器缓存污染
@@ -206,39 +212,115 @@ def _dns_remote_resolve(qname, dnsservers, blacklist, timeout, qtypes=qtypes):
         sock_v6 = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
         socks.append(sock_v6)
     timeout_at = time() + timeout
+    iplist = classlist()
+    _iplist = []
+    xips = []
+    v4_resolved = not A in qtypes
+    v6_resolved = not AAAA in qtypes
+    query_times = 0
     try:
-        for _ in range(2):
-            try:
-                for dnsserver in dns_v4_servers:
-                    for query_data in query_datas:
-                        sock_v4.sendto(query_data, (dnsserver, 53))
-                for dnsserver in dns_v6_servers:
-                    for query_data in query_datas:
-                        sock_v6.sendto(query_data, (dnsserver, 53))
-                while time() < timeout_at:
-                    ins, _, _ = select(socks, [], [], 0.1)
-                    for sock in ins:
-                        reply_data, xip = sock.recvfrom(512)
-                        reply = dnslib.DNSRecord.parse(reply_data)
-                        #未处理 qtypes 包含 ANY 的情况
-                        iplist = classlist(str(x.rdata) for x in reply.rr if x.rtype in qtypes)
-                        if any(x in blacklist for x in iplist):
-                            logging.warning('query qname=%r reply bad iplist=%r', qname, iplist)
-                        else:
-                            logging.debug('query qname=%r reply iplist=%s', qname, iplist)
-                            iplist.xip = xip
-                            return iplist
-            except socket.error as e:
-                logging.warning('handle dns query=%s socket: %r', query, e)
-    finally:
-        for sock in socks:
-            sock.close()
+        for dnsserver in dns_v4_servers:
+            for query_data in query_datas:
+                sock_v4.sendto(query_data, (dnsserver, 53))
+                query_times += 1
+        for dnsserver in dns_v6_servers:
+            for query_data in query_datas:
+                sock_v6.sendto(query_data, (dnsserver, 53))
+                query_times += 1
+    except socket.error as e:
+        logging.warning('send dns query=%s socket: %r', query, e)
+    while time() < timeout_at and not (v4_resolved and v6_resolved) and query_times:
+        try:
+            ins, _, _ = select(socks, [], [], 0.1)
+            for sock in ins:
+                reply_data, xip = sock.recvfrom(512)
+                query_times -= 1
+                reply = dnslib.DNSRecord.parse(reply_data)
+                #只处理 qtypes 包含 A、AAAA 的情况
+                _v4_resolved = v4_resolved
+                _v6_resolved = v6_resolved
+                _iplist.clear()
+                for r in reply.rr:
+                    if r.rtype in qtypes:
+                        ip = None
+                        if r.rtype == A and not v4_resolved:
+                            _v4_resolved = True
+                            ip = str(r.rdata)
+                        elif r.rtype == AAAA and not v6_resolved:
+                            _v6_resolved = True
+                            ip = str(r.rdata)
+                        if ip:
+                            if ip in blacklist:
+                                query_times += 1
+                                _iplist.clear()
+                                logging.warning('query qname=%r reply bad ip=%r', qname, ip)
+                                break
+                            _iplist.append(ip)
+                if _iplist:
+                    v4_resolved = _v4_resolved
+                    v6_resolved = _v6_resolved
+                    iplist.extend(_iplist)
+                if xip[0] not in xips:
+                    xips.append(xip[0])
+        except socket.error as e:
+            logging.warning('receive dns query=%s socket: %r', query, e)
+    for sock in socks:
+        sock.close()
+    logging.debug('query qname=%r reply iplist=%s', qname, iplist)
+    if xips:
+        iplist.xip = '｜'.join(xips), None
+    return iplist
+
+def get_dnsserver_list():
+    import os
+    if os.name == 'nt':
+        import winreg
+        NameServers = []
+        INTERFACES_PATH = 'SYSTEM\\CurrentControlSet\\Services\\Tcpip%s\\Parameters\\Interfaces\\'
+        for v in ('', '6'):
+            interfaces_path = INTERFACES_PATH % v
+            interfaces = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, interfaces_path)
+            sub_key_num, _, _ = winreg.QueryInfoKey(interfaces)
+            for i in range(sub_key_num):
+                try:
+                    interface_path = interfaces_path + winreg.EnumKey(interfaces, i)
+                    interface = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, interface_path)
+                    NameServer, _ = winreg.QueryValueEx(interface, 'NameServer')
+                    winreg.CloseKey(interface)
+                    if NameServer:
+                        NameServers += NameServer.split(',')
+                except:
+                    pass
+            winreg.CloseKey(interfaces)
+        return NameServers
+    elif os.path.isfile('/etc/resolv.conf'):
+        import re
+        with open('/etc/resolv.conf', 'r') as fp:
+            return re.findall(r'(?m)^nameserver\s+(\S+)', fp.read())
+    else:
+        import sys
+        logging.warning('get_dnsserver_list 失败：不支持 "%s-%s" 平台', sys.platform, os.name)
+        return []
+
+local_dnsservers = set(ip for ip in get_dnsserver_list() if isip(ip))
+if '127.0.0.1' in local_dnsservers and '::1' in local_dnsservers:
+    #视为同一个本地服务器，大多数情况下这是正确地
+    local_dnsservers.remove('::1')
+local_dnsservers = list(local_dnsservers)
+if local_dnsservers:
+    logging.test('已读取系统当前 DNS 设置：%r', local_dnsservers)
+else:
+    logging.warning('读取系统当前 DNS 设置失败')
 
 def dns_system_resolve(host):
     now = time()
     try:
         if '6' in GC.LINK_PROFILE:
-            iplist = list(set(ipaddr[4][0] for ipaddr in socket.getaddrinfo(host, None)) - GC.DNS_BLACKLIST)
+            if local_dnsservers:
+                iplist = _dns_remote_resolve(host, local_dnsservers, timeout=4)
+            else:
+                # getaddrinfo 作为后备，Windows 下无法并发，其它系统未知
+                iplist = list(set(ipaddr[4][0] for ipaddr in socket.getaddrinfo(host, None)) - GC.DNS_BLACKLIST)
         else:
             iplist = list(set(socket.gethostbyname_ex(host)[-1]) - GC.DNS_BLACKLIST)
     except:
@@ -268,8 +350,8 @@ def dns_over_https_resolve(host):
 
 #设置使用 DNS 的优先级别
 _DNSLv = {
-    'system'    : dns_system_resolve,
-    'remote'    : dns_remote_resolve,
-    'overhttps' : dns_over_https_resolve
+    'system'   : dns_system_resolve,
+    'remote'   : dns_remote_resolve,
+    'overhttps': dns_over_https_resolve
     }
 dns_resolves = tuple(_DNSLv[lv] for lv in GC.DNS_PRIORITY)

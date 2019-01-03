@@ -6,11 +6,10 @@ import os
 import sys
 #import collections
 import re
-import fnmatch
 from .compat import ConfigParser
-from .common import config_dir, data_dir
+from .path import config_dir, data_dir
 #from .common.proxy import get_system_proxy, parse_proxy
-from . import clogging as logging
+import logging
 
 _LOGLv = {
     0 : logging.WARNING,
@@ -47,6 +46,9 @@ class GC:
     #        CONFIG.set(m.group(1).lower(), m.group(2).lower(), value)
 
     LISTEN_IP = CONFIG.get('listen', 'ip')
+    LISTEN_IPHOST = CONFIG.get('listen', 'iphost')
+    if not LISTEN_IPHOST and LISTEN_IP not in ('0.0.0.0', '::'):
+        LISTEN_IPHOST = LISTEN_IP
     LISTEN_GAE_PORT = CONFIG.getint('listen', 'gae_port')
     LISTEN_AUTO_PORT = CONFIG.getint('listen', 'auto_port')
     LISTEN_VISIBLE = CONFIG.getboolean('listen', 'visible')
@@ -57,6 +59,7 @@ class GC:
     LISTEN_AUTHUSER = tuple(LISTEN_AUTHUSER.split('|')) if LISTEN_AUTHUSER else (':',)
     LISTEN_DEBUGINFO = _LOGLv[min(CONFIG.getint('listen', 'debuginfo'), 3)]
     LISTEN_CHECKPROCESS = CONFIG.getboolean('listen', 'checkprocess')
+    LISTEN_CHECKSYSCA = CONFIG.getboolean('listen', 'checksysca')
 
     GAE_APPIDS = re.findall(r'[\w\-\.]+', CONFIG.get('gae', 'appid').replace('.appspot.com', ''))
     GAE_DEBUG = CONFIG.getint('gae', 'debug')
@@ -85,15 +88,17 @@ class GC:
 
     LINK_PROFILE = CONFIG.get('link', 'profile')
     if LINK_PROFILE not in ('ipv4', 'ipv6', 'ipv46'):
-        LINK_PROFILE = 'ipv4'
-    LINK_WINDOW = min(CONFIG.getint('link', 'window'), 2)
-    LINK_REQUESTCOMPRESS = CONFIG.getboolean('link', 'requestcompress')
+        LINK_PROFILE = 'ipv46'
+    LINK_FASTV6CHECK = CONFIG.getboolean('link', 'fastv6check')
+    LINK_WINDOW = max(min(CONFIG.getint('link', 'window'), 12), 2)
+    LINK_MAXPERIP = max(min(CONFIG.getint('link', 'maxperip'), 32), 3)
+    LINK_RECVBUFFER = max(min(CONFIG.getint('link', 'recvbuffer'), 4194304), 32768)
     #LINK_OPENSSL = CONFIG.getboolean('link', 'openssl')
     LINK_OPENSSL = 1
     LINK_VERIFYG2PK = CONFIG.getboolean('link', 'verifyg2pk')
     LINK_LOCALSSLTXT = CONFIG.get('link', 'localssl') or 'TLS'
     LINK_REMOTESSLTXT = CONFIG.get('link', 'remotessl') or 'TLSv1.2'
-    LINK_LOCALSSL = _SSLv[LINK_LOCALSSLTXT]
+    LINK_LOCALSSL = _SSLv[LINK_LOCALSSLTXT] + (1 if LINK_OPENSSL else 0)
     LINK_REMOTESSL = max(_SSLv[LINK_REMOTESSLTXT], _SSLv['TLS']) + (1 if LINK_OPENSSL else 0)
     LINK_TIMEOUT = max(CONFIG.getint('link', 'timeout'), 3)
     LINK_FWDTIMEOUT = max(CONFIG.getint('link', 'fwdtimeout'), 3)
@@ -136,6 +141,8 @@ class GC:
     FILTER_SSLACTION = CONFIG.getint('filter', 'sslaction')
     FILTER_SSLACTION = FILTER_SSLACTION if FILTER_SSLACTION in (1, 2, 3, 4) else 2
 
+    FINDER_SERVERNAME = CONFIG.get('finder', 'servername').encode()
+    FINDER_COMDOMAIN = CONFIG.get('finder', 'comdomain')
     FINDER_MINIPCNT = int(CONFIG.get('finder', 'minipcnt') or 6)
     FINDER_MAXTIMEOUT = int(CONFIG.get('finder', 'maxtimeout') or 1000)
     FINDER_MAXTHREADS = int(CONFIG.get('finder', 'maxthreads') or 30)
@@ -146,6 +153,10 @@ class GC:
     FINDER_STATDAYS = max(min(FINDER_STATDAYS, 5), 2)
     FINDER_BLOCK = CONFIG.get('finder', 'block')
     FINDER_BLOCK = tuple(FINDER_BLOCK.split('|')) if FINDER_BLOCK else ()
+
+    if not FINDER_SERVERNAME:
+        logging.error('没有找到 [finder/servername]，请检查配置文件：%r，参考注释进行填写。', CONFIG_FILENAME)
+        sys.exit(-1)
 
     #PROXY_ENABLE = CONFIG.getboolean('proxy', 'enable')
     PROXY_ENABLE = False
@@ -189,6 +200,8 @@ class GC:
     DNS_OVER_HTTPS = CONFIG.getboolean('dns', 'overhttps')
     DNS_OVER_HTTPS_LIST = CONFIG.get('dns', 'overhttpslist') or 'google_gws'
     DNS_OVER_HTTPS_ECS = CONFIG.get('dns', 'overhttpsecs')
+    DNS_IP_API = CONFIG.get('dns', 'ipapi')
+    DNS_IP_API = tuple(DNS_IP_API.split('|')) if DNS_IP_API else ()
     DNS_PRIORITY = CONFIG.get('dns', 'priority').split('|')
     DNS_BLACKLIST = set(CONFIG.get('dns', 'blacklist').split('|'))
 
@@ -200,8 +213,10 @@ class GC:
             DNS_PRIORITY.remove(dnstype)
     DNS_PRIORITY.extend(DNS_DEF_PRIORITY)
 
-    DNS_CACHE_ENTRIES = int(CONFIG.get('dns/cache', 'entries') or 128)
+    DNS_CACHE_ENTRIES = int(CONFIG.get('dns/cache', 'entries') or 1024)
     DNS_CACHE_EXPIRATION = int(CONFIG.get('dns/cache', 'expiration') or 7200)
 
-del CONFIG, fnmatch, ConfigParser
-del sys.modules['fnmatch']
+from .common.decompress import _brotli
+
+GC.LINK_REQUESTCOMPRESS = _brotli and CONFIG.getboolean('link', 'requestcompress')
+del CONFIG

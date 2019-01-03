@@ -1,8 +1,9 @@
 # coding:utf-8
 
+import logging
 from .GlobalConfig import GC
 from .ProxyHandler import AutoProxyHandler, GAEProxyHandler
-from .common import logging, LRUCache
+from .common import LRUCache
 
 if GC.LISTEN_AUTH == 2:
     import string
@@ -143,7 +144,7 @@ div, input {font-size: 12pt; font-family: arial,sans-serif}
                 self.do_FAKECERT()
             else:
                 self._do_METHOD()
-                if self.ssl and self.url[8:].lower().startswith(self.login_url):
+                if self.ssl_request or self.ssl and self.url[8:].lower().startswith(self.login_url):
                     #只有登录地址为加密链接时才发送登录页面
                     redirect = ''
                     if self.command == 'POST':
@@ -295,14 +296,6 @@ class AutoProxyAuthHandler(ProxyAuthHandler, AutoProxyHandler):
         if self.check_auth():
             AutoProxyHandler.do_METHOD(self)
 
-    do_GET = do_METHOD
-    do_PUT = do_METHOD
-    do_POST = do_METHOD
-    do_HEAD = do_METHOD
-    do_DELETE = do_METHOD
-    do_OPTIONS = do_METHOD
-    do_PATCH = do_METHOD
-
 class GAEProxyAuthHandler(ProxyAuthHandler, GAEProxyHandler):
 
     def do_CONNECT(self):
@@ -312,11 +305,3 @@ class GAEProxyAuthHandler(ProxyAuthHandler, GAEProxyHandler):
     def do_METHOD(self):
         if self.check_auth():
             GAEProxyHandler.do_METHOD(self)
-
-    do_GET = do_METHOD
-    do_PUT = do_METHOD
-    do_POST = do_METHOD
-    do_HEAD = do_METHOD
-    do_DELETE = do_METHOD
-    do_OPTIONS = do_METHOD
-    do_PATCH = do_METHOD

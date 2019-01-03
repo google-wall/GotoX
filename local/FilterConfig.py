@@ -3,11 +3,12 @@
 import os
 import re
 import threading
+import logging
 from functools import partial
 from time import sleep
-from . import clogging as logging
+from .path import config_dir
 from .compat import thread, ConfigParser
-from .common import config_dir, isip, isipv4, isipv6, classlist
+from .common import isip, isipv4, isipv6, classlist
 from .GlobalConfig import GC
 
 BLOCK     = 1
@@ -105,11 +106,13 @@ class actionfilterlist(list):
                     host = host.lower()
                 if path and path[0] == '@':
                     path = re.compile(path[1:]).search
+                if filters.action == FAKECERT and v and '*' not in v:
+                    v = v.encode()
                 if filters.action in (FORWARD, DIRECT):
                     if isempty(v):
                         v = None
                     elif '|' in v:
-                        v = pickip(' '+v.lower()) or None
+                        v = pickip(v.lower()) or None
                     elif isipuse(v):
                         v = [v]
                     elif isip(v) or not (v in GC.IPLIST_MAP or v.find('.') > 0):

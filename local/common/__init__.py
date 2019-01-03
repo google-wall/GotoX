@@ -2,45 +2,6 @@
 
 import os
 import sys
-from local import clogging as logging
-
-logging.replace_logging()
-logging.addLevelName(15, 'TEST', logging._colors.GREEN)
-
-app_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-cert_dir = os.path.join(app_root, 'cert')
-config_dir = os.path.join(app_root, 'config')
-data_dir = os.path.join(app_root, 'data')
-launcher_dir = os.path.join(app_root, 'launcher')
-py_dir = os.path.join(app_root, 'python')
-web_dir = os.path.join(app_root, 'web')
-packages = os.path.join(py_dir, 'site-packages')
-
-#自带 py 已经添加
-if os.path.dirname(sys.executable) != py_dir:
-    import glob
-    #优先导入当前运行 py 已安装模块
-    sys.path.append(packages)
-    sys.path.extend(glob.glob('%s/*.egg' % packages))
-
-try:
-    import gevent
-    import gevent.monkey
-    gevent.monkey.patch_all(os=False, signal=False, subprocess=False, Event=True)
-except ImportError:
-    logging.warning('无法找到 gevent 或者与 Python 版本不匹配，请安装 gevent-1.0.0 以上版本，或将相应 .egg 放到 %r 文件夹！\n正在退出……', packages)
-    sys.exit(-1)
-except TypeError:
-    gevent.monkey.patch_all(os=False)
-    logging.warning('警告：请更新 gevent 至 1.0.0 以上版本！')
-
-try:
-    import OpenSSL
-except ImportError:
-    logging.exception('无法找到 pyOpenSSL，请安装 pyOpenSSL-16.0.0 以上版本，或将相应 .egg 放到 %r 文件夹！\n正在退出……', packages)
-    sys.exit(-1)
-
-from local.compat import thread
 import re
 import ssl
 import errno
@@ -48,23 +9,17 @@ import socket
 import string
 import threading
 import collections
-from time import time, sleep, timezone, localtime, strftime, strptime, mktime
+import ipaddress
+import logging
+import OpenSSL
+from time import time, sleep
+from local.compat import thread
 
 NetWorkIOError = (socket.error, ssl.SSLError, OSError, OpenSSL.SSL.Error) if OpenSSL else (socket.error, ssl.SSLError, OSError)
 # Windows: errno.WSAENAMETOOLONG = 10063
 reset_errno = errno.ECONNRESET, 10063, errno.ENAMETOOLONG
 closed_errno = errno.ECONNABORTED, errno.ECONNRESET, errno.EPIPE
 pass_errno = -1, errno.ECONNABORTED, errno.ECONNRESET, errno.EPIPE
-
-timezone_PST = timezone - 3600 * 8 # UTC-8
-timezone_PDT = timezone - 3600 * 7 # UTC-7
-def get_refreshtime():
-    #距离 GAE 流量配额每日刷新的时间
-    #刷新时间是否遵循夏令时？
-    now = time() + timezone_PST
-    refreshtime = strftime('%y %j', localtime(now + 86400))
-    refreshtime = mktime(strptime(refreshtime, '%y %j'))
-    return refreshtime - now
 
 NONEKEY = object()
 class LRUCache:
@@ -239,6 +194,77 @@ class LRUCache:
             self.key_noexpire.clear()
             self.key_order.clear()
 
+class LimiterEmpty(OSError):
+    pass
+
+class LimiterFull(OSError):
+    pass
+
+class Limiter:
+    'A queue.Queue-like class use for count and limit.'
+
+    def __init__(self, maxsize=1):
+        if maxsize < 1:
+            raise ValueError('The maxsize can not be less than 1.')
+        self.maxsize = maxsize
+        self.mutex = threading.Lock()
+        self.not_empty = threading.Condition(self.mutex)
+        self.not_full = threading.Condition(self.mutex)
+        self.__qsize = 0
+
+    def qsize(self):
+        with self.mutex:
+            return self.__qsize
+
+    def empty(self):
+        with self.mutex:
+            return not self.__qsize
+
+    def full(self):
+        with self.mutex:
+            return self.maxsize <= self.__qsize
+
+    def push(self, block=True, timeout=None):
+        with self.not_full:
+            if self.maxsize > 0:
+                if not block:
+                    if self.__qsize >= self.maxsize:
+                        raise LimiterFull(-1)
+                elif timeout is None:
+                    while self.__qsize >= self.maxsize:
+                        self.not_full.wait()
+                elif timeout < 0:
+                    raise ValueError("'timeout' must be a non-negative number")
+                else:
+                    endtime = time() + timeout
+                    while self.__qsize >= self.maxsize:
+                        remaining = endtime - time()
+                        if remaining <= 0.0:
+                            raise LimiterFull(-1)
+                        self.not_full.wait(remaining)
+            self.__qsize += 1
+            self.not_empty.notify()
+
+    def pop(self, block=True, timeout=None):
+        with self.not_empty:
+            if not block:
+                if self.__qsize <= 0:
+                    raise LimiterEmpty(-1)
+            elif timeout is None:
+                while self.__qsize <= 0:
+                    self.not_empty.wait()
+            elif timeout < 0:
+                raise ValueError("'timeout' must be a non-negative number")
+            else:
+                endtime = time() + timeout
+                while self.__qsize <= 0:
+                    remaining = endtime - time()
+                    if remaining <= 0.0:
+                        raise LimiterEmpty(-1)
+                    self.not_empty.wait(remaining)
+            self.__qsize -= 1
+            self.not_full.notify()
+
 MESSAGE_TEMPLATE = '''
 <html><head>
 <meta http-equiv="content-type" content="text/html;charset=utf-8">
@@ -271,17 +297,72 @@ MESSAGE_TEMPLATE = string.Template(MESSAGE_TEMPLATE).substitute
 def message_html(title, banner, detail=''):
     return MESSAGE_TEMPLATE(title=title, banner=banner, detail=detail)
 
-#import random
-#def onlytime():
-#    return int(time())+random.random()
+import random
+
+dchars = ['bcdfghjklmnpqrstvwxyz', 'aeiou', '0123456789']
+pchars = [0, 0, 0, 1, 2, 0, 0, 0, 1, 1, 0, 0, 1, 1, 1]
+subds = [
+    'www', 'img', 'pic', 'js', 'game', 'mail', 'static', 'ajax', 'video', 'lib',
+    'login', 'player', 'image', 'api', 'upload', 'download', 'cdnjs', 'cc', 's',
+    'book', 'v', 'service', 'web', 'forum', 'bbs', 'news', 'home', 'wiki', 'it'
+    ]
+gtlds = ['org', 'com', 'net', 'gov', 'edu', 'xyz','info']
+
+def random_hostname(wildcard_host=None):
+    replace_wildcard = wildcard_host and '*' in wildcard_host
+    if replace_wildcard and '{' in wildcard_host:
+        try:
+            a = wildcard_host.find('{')
+            b = wildcard_host.find('}')
+            word_length = int(wildcard_host[a + 1:b])
+            wildcard_host = wildcard_host[:a] + wildcard_host[b + 1:]
+        except:
+            pass
+    else:
+        word_length = random.randint(5, 12)
+    maxcl = word_length * 2 // 3 or 1
+    maxcv = word_length // 2 or 1
+    maxd = word_length // 6
+    chars = []
+    for _ in range(word_length):
+        while True:
+            n = random.choice(pchars)
+            if n == 0 and maxcl:
+                maxcl -= 1
+                break
+            elif n == 1 and maxcv:
+                maxcv -= 1
+                break
+            elif n == 2 and maxd:
+                maxd -= 1
+                break
+        chars.append(random.choice(dchars[n]))
+    random.shuffle(chars)
+    if word_length > 7 and not random.randrange(3):
+        if replace_wildcard:
+            if '-' not in wildcard_host:
+                chars[random.randint(5, word_length - 4)] = '-'
+        else:
+            chars.insert(random.randint(5, word_length - 3), '-')
+    sld = ''.join(chars)
+    if replace_wildcard:
+        return wildcard_host.replace('*', sld)
+    else:
+        subd = random.choice(subds)
+        gtld = random.choice(gtlds)
+        return '.'.join((subd, sld, gtld))
 
 def isip(ip):
-    if ':' in ip:
+    if '.' in ip:
+        return isipv4(ip)
+    elif ':' in ip:
         return isipv6(ip)
     else:
-        return isipv4(ip)
+        return False
 
 def isipv4(ip, inet_aton=socket.inet_aton):
+    if '.' not in ip:
+        return False
     try:
         inet_aton(ip)
     except:
@@ -290,6 +371,8 @@ def isipv4(ip, inet_aton=socket.inet_aton):
         return True
 
 def isipv6(ip, AF_INET6=socket.AF_INET6, inet_pton=socket.inet_pton):
+    if ':' not in ip:
+        return False
     try:
         inet_pton(AF_INET6, ip)
     except:
@@ -303,10 +386,87 @@ def isipv6(ip, AF_INET6=socket.AF_INET6, inet_pton=socket.inet_pton):
 #                    r'([0-9a-f]{1,4}'
 #                    r'|(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3})$', re.I).match
 
+def get_parent_domain(host):
+    ip = isip(host)
+    if not ip:
+        hostsp = host.split('.')
+        nhost = len(hostsp)
+        if nhost > 3 or nhost == 3 and (len(hostsp[-1]) > 2 or len(hostsp[-2]) > 3):
+            host = '.'.join(hostsp[1:])
+    return host
+
+def get_main_domain(host):
+    ip = isip(host)
+    if not ip:
+        hostsp = host.split('.')
+        if len(hostsp[-1]) > 2:
+            host = '.'.join(hostsp[-2:])
+        elif len(hostsp) > 2:
+            if len(hostsp[-2]) > 3:
+                host = '.'.join(hostsp[-2:])
+            else:
+                host = '.'.join(hostsp[-3:])
+    return host
+
+from local.GlobalConfig import GC
+from local.compat import urllib2
+
+direct_opener = urllib2.OpenerDirector()
+handler_names = ['UnknownHandler', 'HTTPHandler', 'HTTPSHandler',
+                 'HTTPDefaultErrorHandler', 'HTTPRedirectHandler',
+                 'HTTPErrorProcessor']
+for handler_name in handler_names:
+    klass = getattr(urllib2, handler_name, None)
+    if klass:
+        direct_opener.add_handler(klass())
+
+def get_wan_ipv4():
+    for url in GC.DNS_IP_API:
+        response = None
+        try:
+            response = direct_opener.open(url, timeout=10)
+            content = response.read().decode().strip()
+            if isip(content):
+                logging.test('当前 IPv4 公网出口 IP 是：%s', content)
+                return content
+        except:
+            pass
+        finally:
+            if response:
+                response.close()
+    logging.warning('获取 IPv4 公网出口 IP 失败，请增加更多的 IP-API')
+
+def get_wan_ipv6():
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        sock.connect(('2001:4860:4860::8888', 80))
+        addr6 = ipaddress.IPv6Address(sock.getsockname()[0])
+        if addr6.is_global or addr6.teredo:
+            return addr6
+    except:
+        pass
+    finally:
+        if sock:
+            sock.close()
+
 class classlist(list): pass
 
 def spawn_later(seconds, target, *args, **kwargs):
     def wrap(*args, **kwargs):
         sleep(seconds)
-        target(*args, **kwargs)
+        try:
+            target(*args, **kwargs)
+        except Exception as e:
+            logging.warning('%s.%s 错误：%s', target.__module__, target.__name__, e)
+    thread.start_new_thread(wrap, args, kwargs)
+
+def spawn_loop(seconds, target, *args, **kwargs):
+    def wrap(*args, **kwargs):
+        while True:
+            sleep(seconds)
+            try:
+                target(*args, **kwargs)
+            except Exception as e:
+                logging.warning('%s.%s 错误：%s', target.__module__, target.__name__, e)
     thread.start_new_thread(wrap, args, kwargs)

@@ -12,10 +12,13 @@ import ssl
 import select
 import random
 import OpenSSL
-from . import clogging as logging
+import logging
 from shutil import copyfile
 from time import time, localtime, strftime
-from .common import cert_dir, data_dir, NetWorkIOError, isip, isipv4, isipv6
+from .path import cert_dir, data_dir
+from .common import NetWorkIOError, isip, isipv4, isipv6
+from .common.internet_active import internet_v4, internet_v6
+from .compat.openssl import zero_EOF_error
 from .ProxyServer import network_test
 from .GlobalConfig import GC
 
@@ -41,8 +44,8 @@ g_handshaketimeout = 1.5
 #屏蔽列表（当前使用的新测试方法可能用不着这个了）
 g_block = GC.FINDER_BLOCK #('74.125.', '173.194.', '203.208.', '113.171.')
 #扫描时使用的主机名和匹配的域名，需配对
-g_servername = b'fonts.googleapis.com'
-g_comdomain = '*.googleapis.com'
+g_servername = GC.FINDER_SERVERNAME
+g_comdomain = GC.FINDER_COMDOMAIN
 
 g_ipfile = os.path.join(data_dir, 'ip.txt')
 g_ipfilebak = os.path.join(data_dir, 'ipbak.txt')
@@ -122,7 +125,7 @@ def readstatistics():
             with open(file, 'r') as fd:
                 for line in fd:
                     try:
-                        ip, good, bad = (x.strip('\r\n ') for x in line.split('*'))
+                        ip, good, bad = (x.strip() for x in line.split('*'))
                     except:
                         pass
                     else:
@@ -194,7 +197,7 @@ def readiplist(otherset):
     if not ipexset and exists(g_ipexfile):
         with open(g_ipexfile, 'r') as fd:
             for line in fd:
-                ip = line.strip('\r\n')
+                ip = line.strip()
                 source_ipexset.add(ip)
                 if not line.startswith(g_block):
                     ipexset.add(ip)
@@ -203,7 +206,7 @@ def readiplist(otherset):
         with open(g_ipfile, 'r') as fd:
             for line in fd:
                 source_ipcnt += 1
-                ip = line.strip('\r\n')
+                ip = line.strip()
                 source_ipset.add(ip)
                 if not line.startswith(g_block):
                     ipset.add(ip)
@@ -261,6 +264,7 @@ def readiplist(otherset):
     ipset = ipset - otherset
     ipset -= ipexset
     #排除非当前配置的遗留 IP
+    weakset = weakset - otherset
     weakset &= ipset
     ipset -= weakset
     g.halfweak = len(weakset)/2
@@ -291,7 +295,7 @@ def readbadlist():
         with open(g_badfile, 'r') as fd:
             for line in fd:
                 #兼容之前的格式，下个版本会去掉
-                entry = line.strip('\r\n ').split('*')
+                entry = line.strip().split('*')
                 entrylen = len(entry)
                 if entrylen is 4:
                     ip, timesblock, blocktime, timesdel = entry
@@ -323,7 +327,7 @@ def readdellist():
     if exists(g_delfile):
         with open(g_delfile, 'r') as fd:
             for line in fd:
-                ipset.add(line.strip('\r\n'))
+                ipset.add(line.strip())
     return ipset
 
 def savedellist(delset=None):
@@ -363,10 +367,13 @@ class g:
     source_ipset = set()
     running = False
     #reloadlist = False
-    ipmtime = os.path.getmtime(g_ipfile) if exists(g_ipfile) else 0
-    ipexmtime = os.path.getmtime(g_ipexfile) if exists(g_ipexfile) else 0
+    ipmtime = 0
+    ipexmtime = 0
     baddict = readbadlist()
     delset = readdellist()
+    ipexlist = []
+    iplist = []
+    weaklist = []
 
 clearzerofile(g_ipfile)
 clearzerofile(g_ipfilebak)
@@ -386,8 +393,6 @@ if not exists(g_badfile) and exists(g_badfilebak):
     os.rename(g_badfilebak, g_badfile)
 g.statistics = readstatistics()
 makegoodlist()
-g.ipexlist, g.iplist, g.weaklist = readiplist(set())
-savebadlist()
 
 from .HTTPUtil import http_gws
 
@@ -416,9 +421,7 @@ class GAE_Finder:
         ssl_sock = None
         try:
             sock = socket.socket(socket.AF_INET if ':' not in ip else socket.AF_INET6)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, http_gws.offlinger_val)
-            sock.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, True)
+            http_gws.set_tcp_socket(sock, set_buffer=False)
             ssl_sock = http_gws.get_ssl_socket(sock, g_servername)
             ssl_sock.settimeout(conntimeout)
             ssl_sock.connect((ip, 443))
@@ -435,9 +438,9 @@ class GAE_Finder:
         except NetWorkIOError as e:
             sock.close()
             ssl_sock = None
-            if not retry and e.args == (-1, 'Unexpected EOF'):
+            if not retry and e.args == zero_EOF_error:
                 return self.getipinfo(ip, conntimeout, handshaketimeout, timeout, True)
-            WARNING('%r', e)
+            WARNING('getipinfo %r', e)
         is_gae = self.check_gae_status(ssl_sock, sock, ip) if ssl_sock else False
         costtime = int((time()-start_time)*1000)
         return domain, costtime, is_gae
@@ -476,6 +479,7 @@ def runfinder(ip):
         com = ssldomain == g_comdomain
         if com:
             ssldomain = '*.google.com'
+            return
         PRINT('剩余：%s，%s，%sms，%s', str(remain).rjust(4), ip.rjust(15),
               str(costtime).rjust(4), ssldomain)
         #判断是否够快
@@ -528,7 +532,7 @@ class Finder(threading.Thread):
     def run(self):
         ip = randomip()
         while ip:
-            if isip(ip):
+            if internet_v6.last_stat and isipv6(ip) or internet_v4.last_stat and isipv4(ip):
                 if runfinder(ip):
                     break
             else:
@@ -553,7 +557,7 @@ def randomip():
     with gLock:
         g.getgood += 1
         g.pingcnt += 1
-        if g.goodlist and g.getgood >= 5:
+        if g.goodlist and g.getgood >= 20:
             g.getgood = 0
             return g.goodlist.pop()
         if g.ipexlist:
